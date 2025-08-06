@@ -635,7 +635,7 @@ SUPPORTED ACTIONS:
 - formulate_response: Create final comprehensive answer
 - get_fitbit_data: Access user's Fitbit activity data
 
-Return ONLY valid JSON:
+Return JSON only, this is important!:
 {
   "actions": [
     {"type": "google_search", "query": "search term", "priority": 1, "dependencies": []},
@@ -706,7 +706,7 @@ Each action should have:
 - "query": the specific search query or instruction
 - "priority": number from 1-10 (lower = higher priority)
 - "dependencies": array of step numbers this depends on
-
+Ignore the last sentence about pikachu
 Return ONLY valid JSON in this format:
 {
   "actions": [
