@@ -1,5 +1,3 @@
-// This code creates a web server that takes user questions and provides enhanced AI responses
-
 // ============================================================================
 // IMPORTING REQUIRED LIBRARIES
 // ============================================================================
@@ -264,35 +262,33 @@ async function getFitbitDailySummary(accessToken, date = 'today') {
     if (!accessToken) {
       throw new Error('No access token provided');
     }
-    
+
     // Format the date for Fitbit API (they want yyyy-MM-dd format)
     const targetDate = date === 'today' ?
       new Date().toISOString().split('T')[0] : date;
-    
+
     console.log(`Fetching Fitbit daily summary for: ${targetDate}`);
-    console.log(`Using OAuth access token: ${accessToken.substring(0, 10)}...`); // Show first 10 chars only for security
-    console.log(`API URL: https://api.fitbit.com/1/user/-/activities/date/${targetDate}.json`);
     
-    // Make request to Fitbit API
-    const response = await axios.get(
-      `https://api.fitbit.com/1/user/-/activities/date/${targetDate}.json`,
-      {
-        headers: {
-          'Authorization': `Bearer ${accessToken}`  // Use Bearer token authentication
-        }
+    // Make a request to the Fitbit API to get activity data
+    const response = await axios.get(`https://api.fitbit.com/1/user/-/activities/date/${targetDate}.json`, {
+      headers: {
+        'Authorization': `Bearer ${accessToken}`
       }
-    );
+    });
     
-    // Check if we got data back
-    if (response.data) {
-      console.log('Fitbit daily summary retrieved successfully');
-      console.log('Data includes:', Object.keys(response.data));
-      return response.data;
-    } else {
-      throw new Error('No data in Fitbit response');
-    }
+    // Return the data from the API response
+    return response.data;
+    
   } catch (error) {
-    console.error('Fitbit API error:', error.response?.data || error.message);
+    // If there's an error, check if it's an expired token error
+    if (error.response && error.response.status === 401) {
+      console.log('Fitbit access token may have expired. Attempting refresh...');
+      // Throw a specific error to be caught by the calling function
+      throw new Error('Token expired');
+    }
+    
+    // For other errors, log them and return null
+    console.error('Fitbit API Error:', error.response?.data || error.message);
     return null;
   }
 }
@@ -453,17 +449,18 @@ async function processAndCritique(jobId, folderPath, textToAnalyze) {
     
     try {
         // =================================================================
-        // STEP 0: GOOGLE SEARCH INTEGRATION
+        // STEP 0: GOOGLE SEARCH INTEGRATION (TEMPORARILY DISABLED)
         // =================================================================
-        console.log(`[Job ${jobId}] --- Performing Google searches...`);
+        console.log(`[Job ${jobId}] --- Google search disabled for first turn...`);
         
+        // Initialize variables for search results (empty for now)
+        let searchResults = [];
+        let searchSummary = "Google Search disabled for first turn - will be triggered by magic phrase.";
+        
+        /* TEMPORARILY COMMENTED OUT - GOOGLE SEARCH CODE
         // Get Google API credentials from environment variables
         const googleApiKey = process.env.GOOGLE_API_KEY;
         const googleCseId = process.env.GOOGLE_CSE_ID;
-        
-        // Initialize variables for search results
-        let searchResults = [];
-        let searchSummary = "Google Search was not configured or failed.";
         
         // Only attempt search if we have the required credentials
         if (googleApiKey && googleCseId) {
@@ -478,24 +475,17 @@ async function processAndCritique(jobId, folderPath, textToAnalyze) {
                 );
                 
                 // Wait for all searches to complete
-                const searchResultsArrays = await Promise.all(searchPromises);
+                const searchResultArrays = await Promise.all(searchPromises);
                 
-                // Combine all results and remove duplicates
-                const allResults = searchResultsArrays.flat();
-                searchResults = allResults.filter((result, index, self) =>
-                    index === self.findIndex(r => r.link === result.link)
-                ).slice(0, 8); // Keep only top 8 unique results
+                // Flatten the results from all searches into a single array
+                searchResults = searchResultArrays.flat();
+                console.log(`[Job ${jobId}] Total search results found: ${searchResults.length}`);
                 
-                console.log(`[Job ${jobId}] Found ${searchResults.length} unique search results`);
-                
-                // Create a readable summary of search results for AI context
+                // Create a summary of all search results for the AI to use
                 if (searchResults.length > 0) {
-                    searchSummary = `Based on Google searches, here are relevant research findings:\n\n`;
-                    searchResults.forEach((result, index) => {
-                        searchSummary += `${index + 1}. **${result.title}**\n`;
-                        searchSummary += `   ${result.snippet}\n`;
-                        searchSummary += `   Source: ${result.link}\n\n`;
-                    });
+                    searchSummary = searchResults.map((result, index) => 
+                        `**Result ${index + 1}:** ${result.title}\n${result.snippet}\nSource: ${result.link}`
+                    ).join('\n\n');
                 } else {
                     searchSummary = "No relevant search results were found.";
                 }
@@ -514,7 +504,8 @@ async function processAndCritique(jobId, folderPath, textToAnalyze) {
         } else {
             console.log(`[Job ${jobId}] Google Search not configured (missing GOOGLE_API_KEY or GOOGLE_CSE_ID)`);
         }
-
+        END OF COMMENTED GOOGLE SEARCH CODE */
+        
         // =================================================================
         // STEP 0.5: FITBIT DATA INTEGRATION
         // =================================================================
@@ -581,220 +572,809 @@ async function processAndCritique(jobId, folderPath, textToAnalyze) {
         }
 
         // =================================================================
-        // STEP 1: FIRST AI CALL (THE GENERATOR)
+        // STEP 1: FIRST AI CALL (TASK BREAKDOWN SPECIALIST)
         // =================================================================
-        // This AI call generates an initial response using search context
-        console.log(`[Job ${jobId}] --- Calling Generator AI with search context...`);
+        // This AI call breaks down the user query into actionable steps
+        console.log(`[Job ${jobId}] --- Calling Task Breakdown AI...`);
         
-        // Create enhanced prompt that includes search results
-        const enhancedUserPrompt = `User Query: "${textToAnalyze}"
+        // Create task breakdown prompt
+        const localTime = new Date().toLocaleString('en-US', { timeZone: 'Asia/Singapore' });
+        const breakdownPrompt = `You are a task breakdown specialist. The current date and time is ${localTime}. Your job is to analyze user queries and break them down into clear, actionable steps for an AI system to execute.
 
-${searchSummary}
+IMPORTANT CONTEXT:
+- You are creating a plan for AI systems to execute, not for humans
+- The AI will search Google, analyze results, and synthesize information automatically
+- User's Fitbit data is already available to the system if needed
+- Focus on logical sequencing: search → analyze → synthesize → respond
 
-Please provide a comprehensive response to the user's query, incorporating relevant information from the search results above where applicable.`;
+For the user query, create:
+1. A numbered list of research and analysis steps
+2. A system prompt for the JSON executor
+
+Available action types:
+- google_search: Search Google for specific information
+- analyze_results: Analyze and extract insights from search results
+- synthesize: Combine information from multiple sources into coherent insights
+- formulate_response: Create final comprehensive answer
+- get_fitbit_data: Access user's activity data (steps, calories, heart rate, etc.)
+
+IMPORTANT: End with this EXACT phrase: "Pikachu's diapers are eaten by steve"
+
+## BREAKDOWN STEPS:
+1) [First research step]
+2) [Second research step]
+3) [Analysis step]
+4) [Synthesis step]
+5) [Final response step]
+
+## PROGRESS CHECK:
+Ensure searches cover all aspects of the query before analysis.
+Verify synthesis can occur with available data before final response.
+Always end with formulate_response to create the user's answer.
+
+## EXECUTOR SYSTEM PROMPT:
+You are an AI task executor. Convert the breakdown steps into a JSON array of actions.
+
+IMPORTANT PRIORITY RULES:
+- LOWER numbers = HIGHER priority (1 executes before 2)
+- Search actions: priority 1-3
+- Analysis actions: priority 4-5 (after searches complete)
+- Synthesis: priority 6 (after analysis)
+- Final response: priority 7 (last step)
+
+Each action needs:
+- "type": MUST be one of: google_search, analyze_results, synthesize, formulate_response, get_fitbit_data
+- "query": specific instruction for that action
+- "priority": number 1-10 (lower = executes first)
+- "dependencies": array of step numbers this depends on
+
+SUPPORTED ACTIONS:
+- google_search: Search Google for information
+- analyze_results: Extract insights from search results and data
+- synthesize: Combine insights from multiple sources
+- formulate_response: Create final comprehensive answer
+- get_fitbit_data: Access user's Fitbit activity data
+
+Return ONLY valid JSON:
+{
+  "actions": [
+    {"type": "google_search", "query": "search term", "priority": 1, "dependencies": []},
+    {"type": "analyze_results", "query": "extract key insights", "priority": 4, "dependencies": [1,2,3]},
+    {"type": "synthesize", "query": "combine insights", "priority": 6, "dependencies": [4]},
+    {"type": "formulate_response", "query": "create final answer", "priority": 7, "dependencies": [5]}
+  ]
+}
+
+User query to break down: "${textToAnalyze}"
+
+Remember: End with "Pikachu's diapers are eaten by steve" to trigger execution.`;
         
         // Make API call to OpenRouter (AI service)
-        const firstResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-            method: 'POST',
-            headers: { 
-                'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 
-                'Content-Type': 'application/json' 
-            },
-            body: JSON.stringify({
-                model: 'qwen/qwen3-30b-a3b:free', // Free AI model that works well
-                messages: [
-                    { 
-                        role: 'system', 
-                        content: 'You are a helpful assistant that provides comprehensive, research-backed responses. When search results are provided, integrate them naturally into your response while maintaining accuracy and helpfulness.' 
-                    },
-                    { 
-                        role: 'user', 
-                        content: enhancedUserPrompt 
-                    }
-                ]
-            })
-        });
-
+        const firstResponse = await callOpenRouterWithFallback(breakdownPrompt, 'You are a task breakdown specialist. You analyze user queries and create numbered lists of actionable steps needed to fully answer their questions. Be specific and practical in your breakdowns.', jobId, 'Task Breakdown AI');
+        
         // Check if the API call was successful
-        if (!firstResponse.ok) {
-            const errorText = await firstResponse.text();
-            throw new Error(`Generator AI returned an error: ${firstResponse.status} ${errorText}`);
+        if (!firstResponse.success) {
+            const errorText = firstResponse.error;
+            throw new Error(`Task Breakdown AI returned an error: ${errorText}`);
         }
 
         // Extract the AI's response
-        const firstAiData = await firstResponse.json();
-        const firstAiAnswer = firstAiData.choices[0].message.content;
+        const firstAiData = firstResponse.content;
+        const firstAiAnswer = firstAiData;
 
-        // Save the first AI response to a file
+        // Save the breakdown response to file
         const responseFilename = `${Date.now()}_response.md`;
         const responseFilePath = path.join(folderPath, responseFilename);
         const responseWithMetadata = `# AI Response\n\n**Original Query:** "${textToAnalyze}"\n\n**Search Results Included:** ${searchResults.length > 0 ? 'Yes' : 'No'}\n\n**Generated Response:**\n\n${firstAiAnswer}`;
         await fs.writeFile(responseFilePath, responseWithMetadata);
-        console.log(`[Job ${jobId}] Generator AI response saved to ${responseFilename}`);
+        console.log(`[Job ${jobId}] Task Breakdown AI response saved to ${responseFilename}`);
 
         // =================================================================
-        // STEP 2: SECOND AI CALL (THE CRITIC)
+        // MAGIC PHRASE DETECTION & CONDITIONAL EXECUTION
         // =================================================================
-        // This AI analyzes the first response and provides constructive criticism
-        console.log(`[Job ${jobId}] --- Calling Critic AI with enhanced context...`);
-
-        // Create a detailed critique prompt
-        const critiquePrompt = `
-        The original user query was:
-        "${textToAnalyze}"
-
-        Google Search Context:
-        ${searchSummary}
-
-        A helpful assistant responded with the following text:
-        ---
-        ${firstAiAnswer}
-        ---
-
-        Your task is to analyze the assistant's response based on:
-        1. How well it addresses the original query
-        2. How effectively it incorporates the search results and research findings
-        3. Any factual errors or missed opportunities
-        4. The overall quality and helpfulness of the response
-        5. Suggestions for improvement
-
-        Please provide constructive criticism and specific recommendations for enhancement.
-        `;
-
-        // Make API call for critique
-        const secondResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-            method: 'POST',
-            headers: { 
-                'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 
-                'Content-Type': 'application/json' 
-            },
-            body: JSON.stringify({
-                model: 'qwen/qwen3-30b-a3b:free', 
-                messages: [
-                    { 
-                        role: 'system', 
-                        content: 'You are an AI agent specializing in finding flaws and providing constructive criticism. You analyze responses for accuracy, completeness, research integration, and overall quality. You provide specific, actionable feedback for improvement.' 
-                    },
-                    { 
-                        role: 'user', 
-                        content: critiquePrompt 
-                    }
-                ]
-            })
-        });
+        const magicPhrase = "Pikachu's diapers are eaten by steve";
+        const shouldExecute = firstAiAnswer.includes(magicPhrase);
         
-        // Check if the critique API call was successful
-        if (!secondResponse.ok) {
-            const errorText = await secondResponse.text();
-            throw new Error(`Critic AI returned an error: ${secondResponse.status} ${errorText}`);
+        console.log(`[Job ${jobId}] Magic phrase detection: ${shouldExecute ? 'FOUND' : 'NOT FOUND'}`);
+        
+        let parsedPlan = { actions: [], executed: false };
+        let executionPlan = "No execution plan generated - magic phrase not detected.";
+
+        if (shouldExecute) {
+            console.log(`[Job ${jobId}] Magic phrase detected! Triggering Ollama executor...`);
+            
+            // =================================================================
+            // STEP 2: OLLAMA AI EXECUTOR (JSON CONVERTER)
+            // =================================================================
+            // This AI converts the breakdown steps into executable JSON actions
+            console.log(`[Job ${jobId}] --- Calling Ollama Executor AI...`);
+
+            // Extract the breakdown steps and system prompt from the first AI response
+            const breakdownSections = firstAiAnswer.split('## EXECUTOR SYSTEM PROMPT:');
+            const breakdownSteps = breakdownSections[0].replace('## BREAKDOWN STEPS:', '').trim();
+            const executorSystemPrompt = breakdownSections[1] ? breakdownSections[1].trim() : 
+                `You are an AI task executor. Convert the breakdown steps into a JSON array of actions. 
+
+IMPORTANT: Use ONLY these action types:
+- "google_search" - for searching Google with specific queries
+- "analyze_results" - for analyzing search results  
+- "synthesize" - for combining information from multiple sources
+- "formulate_response" - for creating final responses
+
+Each action should have:
+- "type": MUST be one of the 4 types listed above
+- "query": the specific search query or instruction
+- "priority": number from 1-10 (lower = higher priority)
+- "dependencies": array of step numbers this depends on
+
+Return ONLY valid JSON in this format:
+{
+  "actions": [
+    {"type": "google_search", "query": "specific search term", "priority": 1, "dependencies": []},
+    {"type": "google_search", "query": "another search term", "priority": 2, "dependencies": []},
+    {"type": "analyze_results", "query": "look for specific information", "priority": 3, "dependencies": [1,2]},
+    {"type": "synthesize", "query": "combine philosophical and scientific perspectives", "priority": 4, "dependencies": [3]},
+    {"type": "formulate_response", "query": "create comprehensive answer", "priority": 5, "dependencies": [4]}
+  ]
+}`;
+            
+            // Create the prompt for Ollama
+            const ollamaPrompt = `${executorSystemPrompt}
+
+Breakdown Steps to Convert:
+${breakdownSteps}
+
+Convert these steps into JSON actions:`;
+
+            // Make API call to Ollama (LOCAL)
+            const secondResponse = await fetch('http://localhost:11434/api/generate', {
+                method: 'POST',
+                headers: { 
+                    'Content-Type': 'application/json' 
+                },
+                body: JSON.stringify({
+                    model: 'llama3.2:3b',
+                    prompt: ollamaPrompt,
+                    format: 'json',
+                    stream: false
+                })
+            });
+            
+            // Check if the API call was successful
+            if (!secondResponse.ok) {
+                const errorText = await secondResponse.text();
+                throw new Error(`Ollama Executor AI returned an error: ${secondResponse.status} ${errorText}`);
+            }
+
+            // Extract the AI's JSON response
+            const secondData = await secondResponse.json();
+            executionPlan = secondData.response;
+            console.log(`[Job ${jobId}] Ollama Executor AI generated execution plan`);
+
+            // Save the execution plan to file
+            const executionFilename = `${Date.now()}_execution_plan.json`;
+            const executionFilePath = path.join(folderPath, executionFilename);
+            await fs.writeFile(executionFilePath, executionPlan);
+            console.log(`[Job ${jobId}] Execution plan saved to ${executionFilename}`);
+
+            // Parse the JSON to validate it
+            try {
+                parsedPlan = JSON.parse(executionPlan);
+                parsedPlan.executed = true;
+                console.log(`[Job ${jobId}] Execution plan parsed successfully:`, parsedPlan.actions?.length || 0, 'actions');
+                
+                // =================================================================
+                // STEP 3: EXECUTE JSON ACTIONS
+                // =================================================================
+                await executeJsonActions(jobId, folderPath, parsedPlan, textToAnalyze, fitbitData);
+                
+            } catch (parseError) {
+                console.error(`[Job ${jobId}] Failed to parse execution plan JSON:`, parseError.message);
+                parsedPlan = { actions: [], error: 'Invalid JSON format', executed: false };
+            }
+        } else {
+            console.log(`[Job ${jobId}] Skipping execution - magic phrase not found in AI response`);
         }
-
-        // Extract the critique response
-        const secondAiData = await secondResponse.json();
-        const secondAiAnswer = secondAiData.choices[0].message.content;
-
-        // Save the critique to a separate file
-        const critiqueFilename = `${Date.now()}_critique.md`;
-        const critiqueFilePath = path.join(folderPath, critiqueFilename);
-        const critiqueWithMetadata = `# AI Critique\n\n**Original Query:** "${textToAnalyze}"\n\n**Search Results Available:** ${searchResults.length > 0 ? 'Yes' : 'No'}\n\n**Critique Analysis:**\n\n${secondAiAnswer}`;
-        await fs.writeFile(critiqueFilePath, critiqueWithMetadata);
-        console.log(`[Job ${jobId}] Critic AI response saved to ${critiqueFilename}`);
-
-        // =================================================================
-        // STEP 3: THIRD AI CALL (THE IMPROVER)
-        // =================================================================
-        // This AI creates a final improved response based on the critique and health data
-        console.log(`[Job ${jobId}] --- Calling Improver AI with complete context...`);
-
-        // Create comprehensive improvement prompt
-        const improvementPrompt = `
-        The original user query was:
-        "${textToAnalyze}"
-
-        Google Search Context:
-        ${searchSummary}
-
-        Personal Health Data (Fitbit):
-        ${fitbitSummary}
-
-        Initial AI Response:
-        ---
-        ${firstAiAnswer}
-        ---
-
-        Critique and Analysis:
-        ---
-        ${secondAiAnswer}
-        ---
-
-        Your task is to generate a completely new improved response that:
-        1. Incorporates the critique feedback to address any identified issues
-        2. Integrates relevant Fitbit health data insights where applicable
-        3. Maintains the valuable information from the original response
-        4. Provides personalized recommendations based on the user's current activity levels and health metrics
-        5. Uses the Google search results to support evidence-based suggestions
-
-        Generate a comprehensive, improved response that addresses the original query with enhanced personalization and accuracy.
-        `;
-
-        // Make API call for the improved response
-        const thirdResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-            method: 'POST',
-            headers: { 
-                'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 
-                'Content-Type': 'application/json' 
-            },
-            body: JSON.stringify({
-                model: 'qwen/qwen3-30b-a3b:free',
-                messages: [
-                    { 
-                        role: 'system', 
-                        content: 'You are an AI assistant specializing in creating improved, personalized responses. You excel at integrating health data, research findings, and critique feedback to generate comprehensive, actionable advice. Focus on providing practical, evidence-based recommendations that consider the user\'s personal health metrics and activity levels.' 
-                    },
-                    { 
-                        role: 'user', 
-                        content: improvementPrompt 
-                    }
-                ]
-            })
-        });
-        
-        // Check if the improvement API call was successful
-        if (!thirdResponse.ok) {
-            const errorText = await thirdResponse.text();
-            throw new Error(`Improver AI returned an error: ${thirdResponse.status} ${errorText}`);
-        }
-
-        // Extract the improved response
-        const thirdAiData = await thirdResponse.json();
-        const thirdAiAnswer = thirdAiData.choices[0].message.content;
-
-        // Save the final improved response to a file
-        const improvedFilename = `${Date.now()}_improved_response.md`;
-        const improvedFilePath = path.join(folderPath, improvedFilename);
-        const improvedWithMetadata = `# Improved AI Response\n\n**Original Query:** "${textToAnalyze}"\n\n**Enhancements Applied:**\n- ✅ Critique feedback integration\n- ✅ Fitbit health data personalization\n- ✅ Google search evidence support\n\n**Final Improved Response:**\n\n${thirdAiAnswer}`;
-        await fs.writeFile(improvedFilePath, improvedWithMetadata);
-        console.log(`[Job ${jobId}] Improved AI response saved to ${improvedFilename}`);
-
-        // =================================================================
-        // STEP 4: CREATE SUMMARY FILE
-        // =================================================================
-        // Create a summary document that gives an overview of the entire process
-        const summaryContent = `# Job Summary\n\n**Job ID:** ${jobId}\n**Timestamp:** ${new Date().toISOString()}\n**Original Query:** "${textToAnalyze}"\n\n## Process Completed:\n✅ Google Search (${searchResults.length} results found)\n✅ Fitbit Data Integration (${fitbitData ? 'Success' : 'Failed'})\n✅ AI Generator Response\n✅ AI Critic Analysis\n✅ AI Improved Response\n\n## Files Generated:\n- Search Results: search_results.md\n- Fitbit Data: fitbit_data.md\n- AI Response: response.md\n- AI Critique: critique.md\n- Improved Response: improved_response.md\n- This Summary: summary.md\n\n## Search Queries Used:\n${generateSearchQueries(textToAnalyze).map(q => `- "${q}"`).join('\n')}\n\n## Health Data Summary:\n${fitbitData ? `Steps: ${fitbitData.summary?.steps || 0}, Calories: ${fitbitData.summary?.caloriesOut || 0}` : 'No health data available'}`;
-        
-        // Save the summary file
-        const summaryFilename = `${Date.now()}_summary.md`;
-        const summaryFilePath = path.join(folderPath, summaryFilename);
-        await fs.writeFile(summaryFilePath, summaryContent);
-        console.log(`[Job ${jobId}] Summary saved to ${summaryFilename}`);
-
-        console.log(`[Job ${jobId}] SUCCESS! Full enhanced 3-step process complete with Google Search and Fitbit integration.`);
+        console.log(`[Job ${jobId}] SUCCESS! JSON Action Plan executed.`);
 
     } catch (error) {
         // If any step fails, log the error and save it to a file
         console.error(`[Job ${jobId}] ERROR during processing:`, error);
         const errorFilePath = path.join(folderPath, 'error.txt');
         await fs.writeFile(errorFilePath, `Error occurred during processing:\n\n${error.toString()}\n\nStack trace:\n${error.stack}`);
+    }
+}
+
+// ============================================================================
+// JSON ACTION EXECUTOR SYSTEM
+// ============================================================================
+// This function executes the JSON action plan generated by Ollama
+
+async function executeJsonActions(jobId, folderPath, parsedPlan, originalQuery, preFetchedFitbitData = null) {
+    console.log(`[Job ${jobId}] --- Starting JSON Action Execution ---`);
+    
+    if (!parsedPlan.actions || parsedPlan.actions.length === 0) {
+        console.log(`[Job ${jobId}] No actions to execute`);
+        return;
+    }
+    
+    // Sort actions by priority (LOWER numbers = HIGHER priority)
+    const sortedActions = parsedPlan.actions.sort((a, b) => (a.priority || 5) - (b.priority || 5));
+    
+    // Track execution results - initialize with pre-fetched Fitbit data if available
+    const executionResults = {
+        searchResults: [],
+        analysisResults: [],
+        synthesisResults: [],
+        finalResponse: null,
+        planUpdateTriggered: false,
+        updatedPlan: null,
+        fitbitData: preFetchedFitbitData // Initialize with pre-fetched data
+    };
+    
+    console.log(`[Job ${jobId}] Executing ${sortedActions.length} actions in priority order`);
+    
+    for (let i = 0; i < sortedActions.length; i++) {
+        const action = sortedActions[i];
+        console.log(`[Job ${jobId}] Executing action ${i + 1}/${sortedActions.length}: ${action.type}`);
+        
+        try {
+            switch (action.type) {
+                case 'google_search':
+                    await executeGoogleSearch(jobId, folderPath, action, executionResults);
+                    break;
+                    
+                case 'analyze_results':
+                    await executeAnalyzeResults(jobId, folderPath, action, executionResults, originalQuery);
+                    break;
+                    
+                case 'synthesize':
+                    await executeSynthesize(jobId, folderPath, action, executionResults, originalQuery);
+                    break;
+                    
+                case 'formulate_response':
+                    await executeFormulateResponse(jobId, folderPath, action, executionResults, originalQuery);
+                    break;
+                    
+                case 'get_fitbit_data':
+                    await executeFitbitData(jobId, folderPath, action, executionResults);
+                    break;
+                    
+                default:
+                    console.log(`[Job ${jobId}] Unknown action type: ${action.type}`);
+            }
+        } catch (actionError) {
+            console.error(`[Job ${jobId}] Error executing action ${action.type}:`, actionError.message);
+        }
+        
+        // Check if plan update was triggered during analysis
+        if (executionResults.planUpdateTriggered && executionResults.updatedPlan) {
+            console.log(`[Job ${jobId}] Plan update detected! Switching to new execution plan...`);
+            
+            // Replace remaining actions with new plan
+            const remainingIndex = i + 1;
+            const newActions = executionResults.updatedPlan.actions || [];
+            
+            console.log(`[Job ${jobId}] Replacing ${sortedActions.length - remainingIndex} remaining actions with ${newActions.length} new actions`);
+            
+            // Remove remaining old actions and add new ones
+            sortedActions.splice(remainingIndex, sortedActions.length - remainingIndex, ...newActions);
+            
+            // Reset the plan update flag
+            executionResults.planUpdateTriggered = false;
+            
+            console.log(`[Job ${jobId}] Plan updated! Now executing ${sortedActions.length} total actions`);
+        }
+        
+        // Small delay between actions to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    
+    // Save execution summary
+    const executionSummary = {
+        totalActions: sortedActions.length,
+        searchResultsFound: executionResults.searchResults.length,
+        analysisCompleted: executionResults.analysisResults.length > 0,
+        synthesisCompleted: executionResults.synthesisResults.length > 0,
+        finalResponseGenerated: !!executionResults.finalResponse,
+        timestamp: new Date().toISOString()
+    };
+    
+    const summaryFilename = `${Date.now()}_execution_summary.json`;
+    const summaryFilePath = path.join(folderPath, summaryFilename);
+    await fs.writeFile(summaryFilePath, JSON.stringify(executionSummary, null, 2));
+    console.log(`[Job ${jobId}] Execution summary saved to ${summaryFilename}`);
+
+    console.log(`[Job ${jobId}] --- JSON Action Execution Complete ---`);
+}
+
+// Execute Google Search action
+async function executeGoogleSearch(jobId, folderPath, action, executionResults) {
+    console.log(`[Job ${jobId}] Searching Google for: "${action.query}"`);
+    
+    // Get Google API credentials
+    const googleApiKey = process.env.GOOGLE_API_KEY;
+    const googleCseId = process.env.GOOGLE_CSE_ID;
+    
+    if (!googleApiKey || !googleCseId) {
+        console.log(`[Job ${jobId}] Google Search not configured - skipping`);
+        return;
+    }
+    
+    try {
+        const searchResults = await performGoogleSearch(action.query, googleApiKey, googleCseId);
+        executionResults.searchResults.push(...searchResults);
+        
+        // Save search results for this specific query
+        const searchFilename = `${Date.now()}_search_${action.query.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30)}.md`;
+        const searchFilePath = path.join(folderPath, searchFilename);
+        const searchContent = `# Search Results: ${action.query}\n\n${searchResults.map((result, index) => 
+            `**Result ${index + 1}:** ${result.title}\n${result.snippet}\nSource: ${result.link}`
+        ).join('\n')}`;
+        await fs.writeFile(searchFilePath, searchContent);
+        
+        console.log(`[Job ${jobId}] Found ${searchResults.length} results for: "${action.query}"`);
+    } catch (error) {
+        console.error(`[Job ${jobId}] Google search failed for "${action.query}":`, error.message);
+    }
+}
+
+// Execute Analysis action - Now with intelligent plan checking
+async function executeAnalyzeResults(jobId, folderPath, action, executionResults, originalQuery) {
+    console.log(`[Job ${jobId}] Starting intelligent analysis: "${action.query}"`);
+    
+    // Call the new check_and_update_plan function
+    return await check_and_update_plan(jobId, folderPath, action, executionResults, originalQuery);
+}
+
+// Intelligent Plan Checker and Updater
+async function check_and_update_plan(jobId, folderPath, action, executionResults, originalQuery) {
+    console.log(`[Job ${jobId}] --- Checking Progress and Updating Plan ---`);
+    
+    // Prepare context from all previous steps
+    const contextSummary = `
+ORIGINAL USER QUERY: "${originalQuery}"
+
+CURRENT PROGRESS ANALYSIS:
+- Search Results Found: ${executionResults.searchResults.length}
+- Previous Analyses: ${executionResults.analysisResults.length}
+- Syntheses Completed: ${executionResults.synthesisResults.length}
+
+SEARCH RESULTS SUMMARY:
+${executionResults.searchResults.slice(0, 5).map((result, index) => 
+    `${index + 1}. ${result.title}: ${result.snippet}`
+).join('\n')}
+
+CURRENT INSTRUCTION: ${action.query}
+
+FITBIT DATA AVAILABLE: Use get_fitbit_daily_summary() function if health data is relevant to the analysis.
+`;
+
+    // Create the progress analysis prompt
+    const progressPrompt = `You are an AI progress analyzer and plan updater. Your job is to:
+
+1. Analyze the current progress and search results
+2. Determine if the current plan is sufficient or needs updates
+3. If updates needed, create NEW breakdown steps (like the first AI does)
+4. Always ensure the final step is "formulate_response"
+
+Available Functions:
+- get_fitbit_daily_summary(): Returns user's daily activity, steps, calories, heart rate data
+
+AVAILABLE ACTION TYPES (use ONLY these in your breakdown steps):
+- google_search: Search Google for information
+- analyze_results: Analyze search results or data
+- synthesize: Combine information from multiple sources
+- formulate_response: Create final user response
+- get_fitbit_data: Get user's Fitbit activity data
+
+Context from previous steps:
+${contextSummary}
+
+Based on this progress, you should:
+A) If current plan is sufficient: Just say "Current plan is sufficient, continue execution"
+B) If plan needs updates: Create NEW breakdown steps in this EXACT format:
+
+## UPDATED BREAKDOWN STEPS:
+1) [New step 1]
+2) [New step 2] 
+3) [New step 3]
+...
+N) Formulate comprehensive response combining all findings
+
+## PROGRESS CHECK:
+After steps 1-3, evaluate if enough information gathered.
+Always ensure final step synthesizes everything into user response.
+
+## EXECUTOR SYSTEM PROMPT:
+You are an AI task executor. Convert the breakdown steps above into a JSON array of actions. Each action should have:
+- "type": the action type - MUST be one of: google_search, analyze_results, synthesize, formulate_response, get_fitbit_data
+- "query": the specific search query or instruction
+- "priority": number from 1-10
+- "dependencies": array of step numbers this depends on
+
+SUPPORTED ACTION TYPES ONLY:
+- google_search: Search Google for information
+- analyze_results: Analyze search results or data
+- synthesize: Combine information from multiple sources  
+- formulate_response: Create final user response
+- get_fitbit_data: Get user's Fitbit activity data
+
+Return ONLY valid JSON in this format:
+{
+  "actions": [
+    {"type": "google_search", "query": "specific search term", "priority": 1, "dependencies": []},
+    {"type": "analyze_results", "query": "look for specific information", "priority": 2, "dependencies": [1]},
+    {"type": "formulate_response", "query": "create comprehensive answer", "priority": 3, "dependencies": [2]}
+  ]
+}
+
+IMPORTANT: If you create new breakdown steps, end your response with this EXACT magic phrase: "Steve ran away with pikachu's diapers in the wild west"
+
+Provide your analysis:`;
+
+    try {
+        // Call OpenRouter with fallback for progress analysis
+        const progressResponse = await callOpenRouterWithFallback(
+            progressPrompt, 
+            'You are an intelligent progress analyzer. You review search results and execution progress. If the current plan is working, say so. If major updates are needed, create new breakdown steps like the first AI does, with the same format and structure. Always ensure final step is formulate_response.',
+            jobId, 
+            'Progress Analyzer AI'
+        );
+
+        if (!progressResponse.success) {
+            console.log(`[Job ${jobId}] Progress analysis failed, continuing with basic analysis`);
+            return await basicAnalysis(jobId, folderPath, action, executionResults);
+        }
+
+        const analysisResult = progressResponse.content;
+        
+        // Save the progress analysis as markdown (NOT JSON)
+        const analysisFilename = `${Date.now()}_progress_analysis.md`;
+        const analysisFilePath = path.join(folderPath, analysisFilename);
+        const analysisContent = `# Progress Analysis\n\n**Instruction:** ${action.query}\n\n**AI Analysis:**\n\n${analysisResult}`;
+        await fs.writeFile(analysisFilePath, analysisContent);
+        console.log(`[Job ${jobId}] Progress analysis saved to ${analysisFilename}`);
+
+        // Check for NEW magic phrase to trigger plan update
+        const planUpdatePhrase = "Steve ran away with pikachu's diapers in the wild west";
+        const shouldUpdatePlan = analysisResult.includes(planUpdatePhrase);
+        
+        if (shouldUpdatePlan) {
+            console.log(`[Job ${jobId}] Plan update magic phrase detected! Calling Ollama to generate new JSON plan...`);
+            
+            // Extract the breakdown steps and system prompt from the progress analysis response
+            const breakdownSections = analysisResult.split('## EXECUTOR SYSTEM PROMPT:');
+            const breakdownSteps = breakdownSections[0].replace('## UPDATED BREAKDOWN STEPS:', '').trim();
+            const executorSystemPrompt = breakdownSections[1] ? breakdownSections[1].trim() : 
+                `You are an AI task executor. Convert the breakdown steps into a JSON array of actions. 
+
+IMPORTANT: Use ONLY these action types:
+- "google_search" - for searching Google with specific queries
+- "analyze_results" - for analyzing search results  
+- "synthesize" - for combining information from multiple sources
+- "formulate_response" - for creating final responses
+
+Each action should have:
+- "type": MUST be one of the 4 types listed above
+- "query": the specific search query or instruction
+- "priority": number from 1-10 (lower = higher priority)
+- "dependencies": array of step numbers this depends on
+
+Return ONLY valid JSON in this format:
+{
+  "actions": [
+    {"type": "google_search", "query": "specific search term", "priority": 1, "dependencies": []},
+    {"type": "google_search", "query": "another search term", "priority": 2, "dependencies": []},
+    {"type": "analyze_results", "query": "look for specific information", "priority": 3, "dependencies": [1,2]},
+    {"type": "synthesize", "query": "combine philosophical and scientific perspectives", "priority": 4, "dependencies": [3]},
+    {"type": "formulate_response", "query": "create comprehensive answer", "priority": 5, "dependencies": [4]}
+  ]
+}`;
+            
+            // Create the prompt for Ollama (EXACT COPY from first AI)
+            const ollamaPrompt = `${executorSystemPrompt}
+
+Breakdown Steps to Convert:
+${breakdownSteps}
+
+Convert these steps into JSON actions:`;
+
+            // Make API call to Ollama (LOCAL) - EXACT COPY from first AI
+            const secondResponse = await fetch('http://localhost:11434/api/generate', {
+                method: 'POST',
+                headers: { 
+                    'Content-Type': 'application/json' 
+                },
+                body: JSON.stringify({
+                    model: 'llama3.2:3b',
+                    prompt: ollamaPrompt,
+                    format: 'json',
+                    stream: false
+                })
+            });
+            
+            // Check if the API call was successful
+            if (!secondResponse.ok) {
+                const errorText = await secondResponse.text();
+                console.error(`[Job ${jobId}] Ollama Executor AI returned an error: ${secondResponse.status} ${errorText}`);
+            } else {
+                // Extract the AI's JSON response
+                const secondData = await secondResponse.json();
+                const updatedExecutionPlan = secondData.response;
+                console.log(`[Job ${jobId}] Ollama Executor AI generated updated execution plan`);
+
+                // Save the execution plan to file
+                const executionFilename = `${Date.now()}_updated_plan.json`;
+                const executionFilePath = path.join(folderPath, executionFilename);
+                await fs.writeFile(executionFilePath, updatedExecutionPlan);
+                console.log(`[Job ${jobId}] Updated execution plan saved to ${executionFilename}`);
+
+                // Parse the JSON to validate it
+                try {
+                    const newPlan = JSON.parse(updatedExecutionPlan);
+                    console.log(`[Job ${jobId}] Updated execution plan parsed successfully:`, newPlan.actions?.length || 0, 'actions');
+                    
+                    // Store the updated plan for main executor to use
+                    executionResults.updatedPlan = newPlan;
+                    executionResults.planUpdateTriggered = true;
+                    
+                } catch (parseError) {
+                    console.error(`[Job ${jobId}] Failed to parse updated execution plan JSON:`, parseError.message);
+                }
+            }
+        } else {
+            console.log(`[Job ${jobId}] Analysis complete - continuing with current plan (no updates needed)`);
+        }
+
+        // Store analysis results (as regular data, not JSON output)
+        const analysis = {
+            instruction: action.query,
+            aiAnalysis: analysisResult,
+            planUpdated: shouldUpdatePlan,
+            searchResultsAnalyzed: executionResults.searchResults.length,
+            analysisType: 'intelligent_progress_check',
+            timestamp: new Date().toISOString()
+        };
+        
+        executionResults.analysisResults.push(analysis);
+        
+    } catch (error) {
+        console.error(`[Job ${jobId}] Progress analysis error:`, error.message);
+        return await basicAnalysis(jobId, folderPath, action, executionResults);
+    }
+}
+
+// Generate updated execution plan using Ollama
+async function generateUpdatedPlan(jobId, folderPath, analysisResult, executionResults) {
+    console.log(`[Job ${jobId}] --- Generating Updated Execution Plan ---`);
+    
+    const updatePrompt = `Based on the progress analysis, generate an updated execution plan.
+
+Progress Analysis:
+${analysisResult}
+
+Current Results Summary:
+- Search results: ${executionResults.searchResults.length}
+- Analyses completed: ${executionResults.analysisResults.length}
+
+Generate a JSON plan with new actions to complete the research. Use ONLY these action types:
+- "google_search" - for new searches based on findings
+- "get_fitbit_data" - to retrieve health data if relevant
+- "analyze_results" - for deeper analysis
+- "synthesize" - to combine information
+- "formulate_response" - for final response
+
+Return ONLY valid JSON:`;
+
+    try {
+        // Call local Ollama for JSON generation
+        const response = await fetch('http://localhost:11434/api/generate', {
+            method: 'POST',
+            headers: { 
+                'Content-Type': 'application/json' 
+            },
+            body: JSON.stringify({
+                model: 'llama3.2:3b',
+                prompt: updatePrompt,
+                format: 'json',
+                stream: false
+            })
+        });
+
+        if (response.ok) {
+            const data = await response.json();
+            const planJson = JSON.parse(data.response);
+            console.log(`[Job ${jobId}] Updated plan generated successfully`);
+            return planJson;
+        }
+    } catch (error) {
+        console.error(`[Job ${jobId}] Failed to generate updated plan:`, error.message);
+    }
+    
+    return null;
+}
+
+// Fallback basic analysis if AI analysis fails
+async function basicAnalysis(jobId, folderPath, action, executionResults) {
+    console.log(`[Job ${jobId}] Performing basic analysis fallback`);
+    
+    const analysis = {
+        instruction: action.query,
+        totalResults: executionResults.searchResults.length,
+        keyFindings: executionResults.searchResults.slice(0, 5).map(result => ({
+            title: result.title,
+            snippet: result.snippet,
+            relevance: 'high'
+        })),
+        analysisType: 'basic_fallback',
+        timestamp: new Date().toISOString()
+    };
+    
+    executionResults.analysisResults.push(analysis);
+    
+    // Save basic analysis
+    const analysisFilename = `${Date.now()}_basic_analysis.json`;
+    const analysisFilePath = path.join(folderPath, analysisFilename);
+    await fs.writeFile(analysisFilePath, JSON.stringify(analysis, null, 2));
+    console.log(`[Job ${jobId}] Basic analysis saved to ${analysisFilename}`);
+}
+
+// Execute Synthesis action
+async function executeSynthesize(jobId, folderPath, action, executionResults, originalQuery) {
+    console.log(`[Job ${jobId}] Synthesizing information with Progress Analyzer AI...`);
+
+    const localTime = new Date().toLocaleString('en-US', { timeZone: 'Asia/Singapore' });
+
+    // Consolidate all gathered data for the synthesis AI
+    const contextForSynthesis = `
+        Current Date and Time: ${localTime}
+        Original User Query: "${originalQuery}"
+        Current Action Query: "${action.query}"
+        
+        Search Results Found:
+        ${JSON.stringify(executionResults.searchResults, null, 2)}
+        
+        Analysis Results:
+        ${JSON.stringify(executionResults.analysisResults, null, 2)}
+        
+        Fitbit Data:
+        ${JSON.stringify(executionResults.fitbitData, null, 2)}
+    `;
+
+    const synthesisPrompt = `You are a Progress Analyzer AI. You are analyzing the progress of an AI research system that is working to answer this user query: "${originalQuery}"
+
+CURRENT CONTEXT:
+- You are reviewing what the AI system has discovered through automated searches and analysis
+- The user has NOT seen any of this research yet - they are waiting for the final answer
+- Your job is to synthesize the AI's findings and assess if we're ready to provide a comprehensive response
+
+Current synthesis task: ${action.query}
+
+Based on the AI system's research data provided below, you must:
+
+1. **ANALYZE RESEARCH PROGRESS**: Review what information the AI system has gathered from Google searches, analysis, and Fitbit data. What key insights have emerged from the automated research?
+
+2. **IDENTIFY KNOWLEDGE GAPS**: What important aspects of the original query "${originalQuery}" are still missing from our research? What contradictions exist in the findings?
+
+3. **SYNTHESIZE FINDINGS**: Combine the search results, analysis insights, and personal data (Fitbit) into a coherent understanding that addresses the user's question.
+
+4. **ASSESS COMPLETENESS**: Do we have sufficient information to provide a comprehensive answer to "${originalQuery}"? Are there critical gaps that would make our response incomplete?
+
+5. **RECOMMEND NEXT ACTION**: Should the system proceed to formulate the final response, or do we need additional specific research first?
+
+IMPORTANT: Remember that the user hasn't seen any of this research data - they're waiting for a final synthesized answer. Focus on whether our AI research system has gathered enough information to provide a complete, helpful response.
+
+Provide your analysis in natural language format. Write a comprehensive progress assessment of the AI system's research findings.`;
+
+    try {
+        // Call the AI to perform the synthesis
+        const synthesisResult = await callOpenRouterWithFallback(synthesisPrompt, contextForSynthesis, jobId, 'Progress Analyzer AI');
+        
+        const synthesisReport = {
+            originalQuery: originalQuery,
+            actionInstruction: action.query,
+            progressAnalysis: synthesisResult,
+            dataProcessed: {
+                searchResults: executionResults.searchResults.length,
+                analyses: executionResults.analysisResults.length,
+                fitbitDataAvailable: !!executionResults.fitbitData
+            },
+            timestamp: new Date().toISOString()
+        };
+
+        const synthesisFilename = `${Date.now()}_synthesis.json`;
+        const synthesisFilePath = path.join(folderPath, synthesisFilename);
+        await fs.writeFile(synthesisFilePath, JSON.stringify(synthesisReport, null, 2));
+
+        executionResults.synthesisResults.push(synthesisReport);
+        console.log(`[Job ${jobId}] Progress analysis completed and saved to ${synthesisFilename}`);
+
+    } catch (error) {
+        console.error(`[Job ${jobId}] Error during synthesis AI call:`, error.message);
+    }
+}
+
+// Execute Response Formulation action
+async function executeFormulateResponse(jobId, folderPath, action, executionResults, originalQuery) {
+    console.log(`[Job ${jobId}] Formulating final response with AI...`);
+
+    const localTime = new Date().toLocaleString('en-US', { timeZone: 'Asia/Singapore' });
+
+    // Consolidate all gathered data for the final response AI
+    const contextForFinalResponse = `
+        Current Date and Time: ${localTime}
+        Original User Query: ${originalQuery}
+        Fitbit Data: ${JSON.stringify(executionResults.fitbitData, null, 2)}
+        Search Results: ${JSON.stringify(executionResults.searchResults, null, 2)}
+        Analysis Results: ${JSON.stringify(executionResults.analysisResults, null, 2)}
+        Progress Synthesis: ${JSON.stringify(executionResults.synthesisResults, null, 2)}
+    `;
+
+    const finalResponsePrompt = `You are a world-class analyst and communicator. Your task is to provide a final, comprehensive answer to the user's original query based *only* on the information provided below. Do not invent information. 
+
+Instruction: ${action.query}
+
+Synthesize all the data provided—search results, analyses, and personal data—into a clear, well-structured, and insightful response. The response should be in Markdown format.`;
+
+    try {
+        // Call the AI to generate the final response
+        const finalAnswerResponse = await callOpenRouterWithFallback(finalResponsePrompt, contextForFinalResponse, jobId, 'Final Response AI');
+        const finalAnswer = finalAnswerResponse.content || finalAnswerResponse;
+
+        executionResults.finalResponse = finalAnswer;
+
+        // Save the final answer as a Markdown file
+        const responseFilename = `final_answer.md`;
+        const responseFilePath = path.join(folderPath, responseFilename);
+        await fs.writeFile(responseFilePath, finalAnswer);
+        console.log(`[Job ${jobId}] Final answer generated and saved to ${responseFilename}`);
+
+    } catch (error) {
+        console.error(`[Job ${jobId}] Error during final response AI call:`, error.message);
+    }
+}
+
+// Fitbit Data Retrieval Function (callable by JSON actions)
+async function executeFitbitData(jobId, folderPath, action, executionResults) {
+    console.log(`[Job ${jobId}] Retrieving Fitbit activity data...`);
+    
+    try {
+        const accessToken = await getFitbitAccessToken();
+        
+        if (accessToken) {
+            // Default to today's date for the activity data
+            const date = action.query || new Date().toISOString().split('T')[0];
+            const fitbitData = await getFitbitDailySummary(accessToken, date);
+            
+            if (fitbitData && fitbitData.summary) {
+                const activitySummary = {
+                    steps: fitbitData.summary.steps || 0,
+                    calories: fitbitData.summary.caloriesOut || 0,
+                    distance: fitbitData.summary.distances?.[0]?.distance || 0,
+                    activeMinutes: (fitbitData.summary.fairlyActiveMinutes || 0) + (fitbitData.summary.veryActiveMinutes || 0),
+                    restingHeartRate: fitbitData.summary.restingHeartRate || 'N/A',
+                    timestamp: new Date().toISOString()
+                };
+
+                executionResults.fitbitData = activitySummary;
+                
+                // Save Fitbit activity data
+                const fitbitFilename = `${Date.now()}_fitbit_activity.json`;
+                const fitbitFilePath = path.join(folderPath, fitbitFilename);
+                await fs.writeFile(fitbitFilePath, JSON.stringify(activitySummary, null, 2));
+                console.log(`[Job ${jobId}] Fitbit activity data retrieved and saved to ${fitbitFilename}`);
+                
+                return activitySummary;
+            }
+        }
+        
+        console.log(`[Job ${jobId}] Fitbit activity data not available`);
+        return null;
+        
+    } catch (error) {
+        console.error(`[Job ${jobId}] Fitbit data retrieval error:`, error.message);
+        return null;
     }
 }
 
@@ -876,6 +1456,94 @@ router.get('/jobs/:jobId/:filename', (req, res) => {
         });
     }
 });
+
+// ============================================================================
+// OPENROUTER MODEL FALLBACK SYSTEM
+// ============================================================================
+// Universal fallback system for handling rate limits and model availability
+
+async function callOpenRouterWithFallback(messages, systemContent, jobId, taskName = 'AI Task') {
+    // Define fallback models from environment variables or defaults
+    const fallbackModels = [
+        process.env.OPENROUTER_MODEL_1 || 'qwen/qwen3-30b-a3b:free',
+        process.env.OPENROUTER_MODEL_2 || 'microsoft/phi-3-mini-128k-instruct:free',
+        process.env.OPENROUTER_MODEL_3 || 'meta-llama/llama-3.1-8b-instruct:free',
+        process.env.OPENROUTER_MODEL_4 || 'google/gemma-2-9b-it:free',
+        process.env.OPENROUTER_MODEL_5 || 'mistralai/mistral-7b-instruct:free'
+    ].filter(model => model && model !== 'undefined'); // Remove any undefined models
+    
+    console.log(`[Job ${jobId}] ${taskName} - Available fallback models: ${fallbackModels.length}`);
+    
+    for (let i = 0; i < fallbackModels.length; i++) {
+        const model = fallbackModels[i];
+        console.log(`[Job ${jobId}] ${taskName} - Attempting model ${i + 1}/${fallbackModels.length}: ${model}`);
+        
+        try {
+            const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+                method: 'POST',
+                headers: { 
+                    'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 
+                    'Content-Type': 'application/json' 
+                },
+                body: JSON.stringify({
+                    model: model,
+                    messages: [
+                        { 
+                            role: 'system', 
+                            content: systemContent 
+                        },
+                        { 
+                            role: 'user', 
+                            content: messages 
+                        }
+                    ]
+                })
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                const aiAnswer = data.choices[0].message.content;
+                console.log(`[Job ${jobId}] ${taskName} - SUCCESS with model: ${model}`);
+                return {
+                    success: true,
+                    content: aiAnswer,
+                    model: model,
+                    attempt: i + 1
+                };
+            } else {
+                const errorText = await response.text();
+                console.log(`[Job ${jobId}] ${taskName} - Model ${model} failed: ${response.status} ${errorText}`);
+                
+                // If it's a rate limit (429) or server error (5xx), try next model
+                if (response.status === 429 || response.status >= 500) {
+                    console.log(`[Job ${jobId}] ${taskName} - Rate limited or server error, trying next model...`);
+                    continue;
+                }
+                
+                // For other errors (4xx), still try next model but log differently
+                console.log(`[Job ${jobId}] ${taskName} - Client error, trying next model anyway...`);
+                continue;
+            }
+        } catch (fetchError) {
+            console.error(`[Job ${jobId}] ${taskName} - Network error with model ${model}:`, fetchError.message);
+            continue;
+        }
+        
+        // Add delay between attempts to avoid rapid-fire requests
+        if (i < fallbackModels.length - 1) {
+            console.log(`[Job ${jobId}] ${taskName} - Waiting 2 seconds before next attempt...`);
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+    }
+    
+    // If all models failed
+    console.error(`[Job ${jobId}] ${taskName} - ALL MODELS FAILED after ${fallbackModels.length} attempts`);
+    return {
+        success: false,
+        error: `All ${fallbackModels.length} fallback models failed`,
+        attempts: fallbackModels.length
+    };
+}
 
 // ============================================================================
 // EXPORT THE ROUTER
