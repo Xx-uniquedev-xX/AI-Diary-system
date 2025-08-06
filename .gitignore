@@ -38,3 +38,5 @@ ai_outputs/
 .Trashes
 ehthumbs.db
 Thumbs.db
+# internal plans
+plan.md
