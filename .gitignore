@@ -1,0 +1,40 @@
+# Environment variables (contains sensitive data)
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# Node.js dependencies
+node_modules/
+
+# Log files
+*.log
+npm-debug.log*
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Optional npm cache directory
+.npm
+
+# Output of 'npm pack'
+*.tgz
+
+# dotenv environment variables file
+.env*
+
+# AI outputs folder (optional - if you don't want to backup AI responses)
+ai_outputs/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

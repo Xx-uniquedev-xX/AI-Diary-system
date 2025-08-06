@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Website with Google Search</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            font-family: Arial, sans-serif;
+            background: #f8f9fa;
+        }
+        
+        .content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            text-align: center;
+        }
+        
+        .input-container {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 10px;
+            padding: 20px;
+            background: #fff;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            border: 1px solid #e9ecef;
+        }
+        
+        #textInput {
+            padding: 12px;
+            border: 2px solid #e9ecef;
+            border-radius: 8px;
+            min-width: 350px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+        
+        #textInput:focus {
+            outline: none;
+            border-color: #007bff;
+        }
+        
+        #submitButton {
+            padding: 12px 24px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: background-color 0.3s;
+        }
+        
+        #submitButton:hover {
+            background: #0056b3;
+        }
+        
+        #submitButton:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+        }
+        
+        #response {
+            margin: 20px auto;
+            max-width: 600px;
+            padding: 20px;
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            border-radius: 8px;
+            display: none;
+        }
+        
+        .jobs-section {
+            max-width: 800px;
+            width: 100%;
+            margin-top: 30px;
+        }
+        
+        .jobs-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        
+        .refresh-btn {
+            padding: 8px 16px;
+            background: #28a745;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        
+        .refresh-btn:hover {
+            background: #218838;
+        }
+        
+        .job-card {
+            background: white;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            border-left: 4px solid #007bff;
+        }
+        
+        .job-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        
+        .job-id {
+            font-weight: bold;
+            color: #007bff;
+        }
+        
+        .job-time {
+            color: #666;
+            font-size: 12px;
+        }
+        
+        .job-files {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        
+        .file-btn {
+            padding: 4px 8px;
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: background-color 0.2s;
+        }
+        
+        .file-btn:hover {
+            background: #e9ecef;
+        }
+        
+        .loading {
+            text-align: center;
+            color: #666;
+            padding: 20px;
+        }
+        
+        .feature-list {
+            list-style: none;
+            padding: 0;
+            margin: 20px 0;
+        }
+        
+        .feature-list li {
+            padding: 5px 0;
+            color: #666;
+        }
+        
+        .feature-list li:before {
+            content: "✓ ";
+            color: #28a745;
+            font-weight: bold;
+        }
+        
+        .fitbit-status {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            border-left: 4px solid #ff6b35;
+            max-width: 600px;
+            width: 100%;
+        }
+        
+        .status-authorized {
+            border-left-color: #28a745;
+        }
+        
+        .status-expired {
+            border-left-color: #dc3545;
+        }
+        
+        .status-loading {
+            color: #666;
+            text-align: center;
+        }
+        
+        .fitbit-info {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .fitbit-details {
+            font-size: 14px;
+            color: #666;
+        }
+        
+        .auth-button {
+            padding: 10px 20px;
+            background: #ff6b35;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+            text-decoration: none;
+            display: inline-block;
+            transition: background-color 0.3s;
+        }
+        
+        .auth-button:hover {
+            background: #e55a2b;
+        }
+        
+        .auth-button.success {
+            background: #28a745;
+        }
+        
+        .auth-button.success:hover {
+            background: #218838;
+        }
+        
+        .continue-button {
+            background: #007bff;
+            margin-left: 10px;
+        }
+        
+        .continue-button:hover {
+            background: #0056b3;
+        }
+    </style>
+</head>
+<body>
+    <div class="content">
+        <h1>AI Health Assistant</h1>
+        <div class="subtitle">
+            Enhanced 3-step AI analysis with Google Search and Fitbit integration
+        </div>
+        
+        <!-- Fitbit Status Section -->
+        <div id="fitbitStatus" class="fitbit-status">
+            <div class="status-loading">Checking Fitbit authorization...</div>
+        </div>
+        
+        <ul class="feature-list">
+            <li>Google Search integration for research-backed responses</li>
+            <li>Fitbit health data integration for personalized advice</li>
+            <li>Three-step AI analysis: Generator + Critic + Improver</li>
+            <li>Automatic file generation and storage</li>
+            <li>Background processing with job tracking</li>
+        </ul>
+        
+        <div class="jobs-section">
+            <div class="jobs-header">
+                <h3>Recent Jobs</h3>
+                <button class="refresh-btn" onclick="loadJobs()">Refresh</button>
+            </div>
+            <div id="jobsList" class="loading">
+                Loading jobs...
+            </div>
+        </div>
+    </div>
+    
+    <div class="input-container">
+        <input type="text" id="textInput" placeholder="Enter your query for AI analysis with Google Search...">
+        <button id="submitButton">Submit</button>
+    </div>
+    
+    <div id="response"></div>
+
+    <script>
+        // Load jobs and check Fitbit status on page load
+        window.addEventListener('load', () => {
+            loadJobs();
+            checkFitbitStatus();
+        });
+        
+        // Check Fitbit authorization status
+        async function checkFitbitStatus() {
+            const statusDiv = document.getElementById('fitbitStatus');
+            
+            try {
+                const response = await fetch('/api/auth/fitbit/status');
+                const data = await response.json();
+                
+                if (data.authorized) {
+                    // Authorized and valid
+                    const expiresAt = new Date(data.tokenInfo.expiresAt);
+                    const expiresIn = Math.floor(data.tokenInfo.expiresIn / 3600); // hours
+                    
+                    statusDiv.className = 'fitbit-status status-authorized';
+                    statusDiv.innerHTML = `
+                        <div class="fitbit-info">
+                            <div>
+                                <strong>✅ Fitbit Connected</strong>
+                                <div class="fitbit-details">Token expires in ${expiresIn} hours (${expiresAt.toLocaleString()})</div>
+                            </div>
+                            <button class="auth-button success" onclick="checkFitbitStatus()">Refresh Status</button>
+                        </div>
+                    `;
+                } else {
+                    // Not authorized or expired
+                    statusDiv.className = 'fitbit-status status-expired';
+                    statusDiv.innerHTML = `
+                        <div class="fitbit-info">
+                            <div>
+                                <strong>❌ Fitbit Authorization Required</strong>
+                                <div class="fitbit-details">Click to authorize access to your Fitbit data for personalized health insights</div>
+                            </div>
+                            <div>
+                                <button class="auth-button" onclick="authorizeFitbit()">Authorize Fitbit</button>
+                                <button class="auth-button continue-button" onclick="continueWithoutFitbit()">Continue Without Fitbit</button>
+                            </div>
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                console.error('Error checking Fitbit status:', error);
+                statusDiv.className = 'fitbit-status';
+                statusDiv.innerHTML = `
+                    <div class="fitbit-info">
+                        <div>
+                            <strong>⚠️ Unable to check Fitbit status</strong>
+                            <div class="fitbit-details">There was an error checking your Fitbit authorization</div>
+                        </div>
+                        <button class="auth-button" onclick="checkFitbitStatus()">Retry</button>
+                    </div>
+                `;
+            }
+        }
+        
+        // Authorize Fitbit
+        async function authorizeFitbit() {
+            try {
+                const response = await fetch('/api/auth/fitbit');
+                const data = await response.json();
+                
+                // Open authorization URL in new tab
+                window.open(data.authorizationUrl, '_blank');
+                
+                // Update UI to show waiting state
+                const statusDiv = document.getElementById('fitbitStatus');
+                statusDiv.innerHTML = `
+                    <div class="fitbit-info">
+                        <div>
+                            <strong>🔄 Waiting for Authorization</strong>
+                            <div class="fitbit-details">Please complete authorization in the new tab, then click "Check Status"</div>
+                        </div>
+                        <button class="auth-button" onclick="checkFitbitStatus()">Check Status</button>
+                    </div>
+                `;
+            } catch (error) {
+                console.error('Error getting authorization URL:', error);
+                alert('Error getting authorization URL. Please try again.');
+            }
+        }
+        
+        // Continue without Fitbit (for testing)
+        function continueWithoutFitbit() {
+            const statusDiv = document.getElementById('fitbitStatus');
+            statusDiv.className = 'fitbit-status';
+            statusDiv.innerHTML = `
+                <div class="fitbit-info">
+                    <div>
+                        <strong>⚠️ Running without Fitbit data</strong>
+                        <div class="fitbit-details">AI analysis will work but won't include personalized health insights</div>
+                    </div>
+                    <button class="auth-button" onclick="authorizeFitbit()">Authorize Fitbit</button>
+                </div>
+            `;
+        }
+
+        // Submit button functionality
+        document.getElementById('submitButton').addEventListener('click', async () => {
+            const textInput = document.getElementById('textInput');
+            const responseDiv = document.getElementById('response');
+            const submitButton = document.getElementById('submitButton');
+            
+            if (!textInput.value.trim()) {
+                alert('Please enter some text');
+                return;
+            }
+            
+            // Check Fitbit status before processing
+            let fitbitStatus = 'unknown';
+            try {
+                const statusResponse = await fetch('/api/auth/fitbit/status');
+                const statusData = await statusResponse.json();
+                fitbitStatus = statusData.authorized ? 'authorized' : 'not_authorized';
+            } catch (error) {
+                console.warn('Could not check Fitbit status:', error);
+            }
+            
+            // Disable button during processing
+            submitButton.disabled = true;
+            submitButton.textContent = 'Processing...';
+            
+            try {
+                const response = await fetch('/api/process-and-save', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ text: textInput.value })
+                });
+                
+                const data = await response.json();
+                
+                console.log('Server Response:', data);
+                
+                responseDiv.style.display = 'block';
+                
+                let fitbitMessage = '';
+                if (fitbitStatus === 'authorized') {
+                    fitbitMessage = '<br><small>✅ Including personalized Fitbit health data in analysis</small>';
+                } else {
+                    fitbitMessage = '<br><small>⚠️ Running without Fitbit data - authorize above for personalized health insights</small>';
+                }
+                
+                responseDiv.innerHTML = `
+                    <strong>🚀 Job Started!</strong><br>
+                    Your 3-step AI analysis is now running in the background.<br>
+                    <strong>Job ID:</strong> ${data.jobId}<br>
+                    <small>The system will perform Google searches, generate responses, critique, and improve with health insights.</small>
+                    ${fitbitMessage}
+                `;
+                
+                textInput.value = '';
+                
+                // Refresh jobs list after a short delay
+                setTimeout(loadJobs, 2000);
+
+            } catch (error) {
+                console.error('Error:', error);
+                responseDiv.style.display = 'block';
+                responseDiv.innerHTML = `<strong>❌ Error:</strong> ${error.message}`;
+                responseDiv.style.background = '#f8d7da';
+                responseDiv.style.borderColor = '#f5c6cb';
+            } finally {
+                // Re-enable button
+                submitButton.disabled = false;
+                submitButton.textContent = 'Submit';
+            }
+        });
+        
+        // Allow Enter key to submit
+        document.getElementById('textInput').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                document.getElementById('submitButton').click();
+            }
+        });
+
+        // Load and display jobs
+        async function loadJobs() {
+            const jobsList = document.getElementById('jobsList');
+            
+            try {
+                const response = await fetch('/api/jobs');
+                const data = await response.json();
+                
+                if (data.jobs && data.jobs.length > 0) {
+                    jobsList.innerHTML = data.jobs.map(job => `
+                        <div class="job-card">
+                            <div class="job-header">
+                                <span class="job-id">Job ${job.jobId}</span>
+                                <span class="job-time">${new Date(job.created).toLocaleString()}</span>
+                            </div>
+                            <div class="job-files">
+                                ${job.files.map(file => `
+                                    <button class="file-btn" onclick="viewFile('${job.jobId}', '${file}')">
+                                        ${file}
+                                    </button>
+                                `).join('')}
+                            </div>
+                        </div>
+                    `).join('');
+                } else {
+                    jobsList.innerHTML = '<div class="loading">No jobs found. Submit a query to get started!</div>';
+                }
+            } catch (error) {
+                console.error('Error loading jobs:', error);
+                jobsList.innerHTML = '<div class="loading">Error loading jobs.</div>';
+            }
+        }
+
+        // View file content
+        async function viewFile(jobId, filename) {
+            try {
+                const response = await fetch(`/api/jobs/${jobId}/${filename}`);
+                const data = await response.json();
+                
+                // Create a new window to display the file content
+                const newWindow = window.open('', '_blank');
+                newWindow.document.write(`
+                    <html>
+                        <head>
+                            <title>${filename} - Job ${jobId}</title>
+                            <style>
+                                body { 
+                                    font-family: Arial, sans-serif; 
+                                    max-width: 800px; 
+                                    margin: 0 auto; 
+                                    padding: 20px; 
+                                    line-height: 1.6;
+                                }
+                                pre { 
+                                    background: #f8f9fa; 
+                                    padding: 15px; 
+                                    border-radius: 5px; 
+                                    overflow-x: auto;
+                                    white-space: pre-wrap;
+                                }
+                                h1, h2, h3 { color: #333; }
+                            </style>
+                        </head>
+                        <body>
+                            <h1>${filename}</h1>
+                            <p><strong>Job ID:</strong> ${jobId}</p>
+                            <hr>
+                            <pre>${data.content}</pre>
+                        </body>
+                    </html>
+                `);
+                newWindow.document.close();
+            } catch (error) {
+                console.error('Error viewing file:', error);
+                alert('Error loading file content');
+            }
+        }
+    </script>
+</body>
+</html>
