@@ -109,8 +109,8 @@ function getFitbitAuthorizationUrl() {
   // In production, store this in a database or session
   global.fitbitPKCE = { codeVerifier, state };
   
-  // Define what permissions we're asking for
-  const scopes = ['activity', 'heartrate', 'profile'].join(' ');
+  // Define what permissions we're asking for - UPDATED to include sleep data
+  const scopes = ['activity', 'heartrate', 'profile', 'sleep'].join(' ');
   
   // Build the authorization URL step by step
   const authUrl = new URL('https://www.fitbit.com/oauth2/authorize');
@@ -293,6 +293,43 @@ async function getFitbitDailySummary(accessToken, date = 'today') {
   }
 }
 
+// FIXED: Get sleep data from Fitbit API
+async function getFitbitSleepData(accessToken, date = 'today') {
+  try {
+    // Make sure we have an access token
+    if (!accessToken) {
+      throw new Error('No access token provided');
+    }
+
+    // Format the date for Fitbit API (they want yyyy-MM-dd format)
+    const targetDate = date === 'today' ?
+      new Date().toISOString().split('T')[0] : date;
+
+    console.log(`Fetching Fitbit sleep data for: ${targetDate}`);
+    
+    // Make a request to the Fitbit API to get sleep data
+    const response = await axios.get(`https://api.fitbit.com/1.2/user/-/sleep/date/${targetDate}.json`, {
+      headers: {
+        'Authorization': `Bearer ${accessToken}`
+      }
+    });
+    
+    // Return the data from the API response
+    return response.data;
+    
+  } catch (error) {
+    // If there's an error, check if it's an expired token error
+    if (error.response && error.response.status === 401) {
+      console.log('Fitbit access token may have expired. Attempting refresh...');
+      throw new Error('Token expired');
+    }
+    
+    // For other errors, log them and return null
+    console.error('Fitbit Sleep API Error:', error.response?.data || error.message);
+    return null;
+  }
+}
+
 // ============================================================================
 // SEARCH QUERY GENERATION
 // ============================================================================
@@ -457,55 +494,6 @@ async function processAndCritique(jobId, folderPath, textToAnalyze) {
         let searchResults = [];
         let searchSummary = "Google Search disabled for first turn - will be triggered by magic phrase.";
         
-        /* TEMPORARILY COMMENTED OUT - GOOGLE SEARCH CODE
-        // Get Google API credentials from environment variables
-        const googleApiKey = process.env.GOOGLE_API_KEY;
-        const googleCseId = process.env.GOOGLE_CSE_ID;
-        
-        // Only attempt search if we have the required credentials
-        if (googleApiKey && googleCseId) {
-            try {
-                // Generate multiple search queries for comprehensive results
-                const searchQueries = generateSearchQueries(textToAnalyze);
-                console.log(`[Job ${jobId}] Generated search queries:`, searchQueries);
-                
-                // Perform all searches concurrently (faster than doing them one by one)
-                const searchPromises = searchQueries.map(query =>
-                    performGoogleSearch(query, googleApiKey, googleCseId)
-                );
-                
-                // Wait for all searches to complete
-                const searchResultArrays = await Promise.all(searchPromises);
-                
-                // Flatten the results from all searches into a single array
-                searchResults = searchResultArrays.flat();
-                console.log(`[Job ${jobId}] Total search results found: ${searchResults.length}`);
-                
-                // Create a summary of all search results for the AI to use
-                if (searchResults.length > 0) {
-                    searchSummary = searchResults.map((result, index) => 
-                        `**Result ${index + 1}:** ${result.title}\n${result.snippet}\nSource: ${result.link}`
-                    ).join('\n\n');
-                } else {
-                    searchSummary = "No relevant search results were found.";
-                }
-                
-                // Save search results to a file for later reference
-                const searchFilename = `${Date.now()}_search_results.md`;
-                const searchFilePath = path.join(folderPath, searchFilename);
-                const searchFileContent = `# Google Search Results\n\nOriginal Query: "${textToAnalyze}"\n\nSearch Queries Used: ${searchQueries.join(', ')}\n\n${searchSummary}`;
-                await fs.writeFile(searchFilePath, searchFileContent);
-                console.log(`[Job ${jobId}] Search results saved to ${searchFilename}`);
-                
-            } catch (searchError) {
-                console.error(`[Job ${jobId}] Search error:`, searchError);
-                searchSummary = `Google Search encountered an error: ${searchError.message}`;
-            }
-        } else {
-            console.log(`[Job ${jobId}] Google Search not configured (missing GOOGLE_API_KEY or GOOGLE_CSE_ID)`);
-        }
-        END OF COMMENTED GOOGLE SEARCH CODE */
-        
         // =================================================================
         // STEP 0.5: FITBIT DATA INTEGRATION
         // =================================================================
@@ -577,26 +565,35 @@ async function processAndCritique(jobId, folderPath, textToAnalyze) {
         // This AI call breaks down the user query into actionable steps
         console.log(`[Job ${jobId}] --- Calling Task Breakdown AI...`);
         
-        // Create task breakdown prompt
+        // Create task breakdown prompt - FIXED SYSTEM PROMPT
         const localTime = new Date().toLocaleString('en-US', { timeZone: 'Asia/Singapore' });
-        const breakdownPrompt = `You are a task breakdown specialist. The current date and time is ${localTime}. Your job is to analyze user queries and break them down into clear, actionable steps for an AI system to execute.
+        const breakdownPrompt = `You are a health-focused task breakdown specialist. The current date and time is ${localTime}. Your job is to analyze user health queries and break them down into clear, actionable steps for an AI research system to execute.
 
 IMPORTANT CONTEXT:
 - You are creating a plan for AI systems to execute, not for humans
 - The AI will search Google, analyze results, and synthesize information automatically
 - User's Fitbit data is already available to the system if needed
 - Focus on logical sequencing: search → analyze → synthesize → respond
+- Prioritize high-quality, medically relevant search queries
+
+SEARCH QUERY GUIDELINES:
+- Use specific medical/health terminology when appropriate
+- Include terms like "medical", "health", "research", "study" to improve result quality
+- Avoid generic terms that might return irrelevant content
+- Focus on evidence-based, scientific sources
+- Consider multiple perspectives (symptoms, causes, treatments, lifestyle factors)
 
 For the user query, create:
-1. A numbered list of research and analysis steps
+1. A numbered list of research and analysis steps with high-quality search queries
 2. A system prompt for the JSON executor
 
-Available action types:
-- google_search: Search Google for specific information
+VALID ACTION TYPES (use ONLY these):
+- google_search: Search Google for specific information (use targeted medical/health terms)
 - analyze_results: Analyze and extract insights from search results
 - synthesize: Combine information from multiple sources into coherent insights
 - formulate_response: Create final comprehensive answer
 - get_fitbit_data: Access user's activity data (steps, calories, heart rate, etc.)
+- get_fitbit_sleep: Access user's sleep data (duration, efficiency, stages, etc.)
 
 IMPORTANT: End with this EXACT phrase: "Pikachu's diapers are eaten by steve"
 
@@ -623,7 +620,7 @@ IMPORTANT PRIORITY RULES:
 - Final response: priority 7 (last step)
 
 Each action needs:
-- "type": MUST be one of: google_search, analyze_results, synthesize, formulate_response, get_fitbit_data
+- "type": MUST be one of: google_search, analyze_results, synthesize, formulate_response, get_fitbit_data, get_fitbit_sleep
 - "query": specific instruction for that action
 - "priority": number 1-10 (lower = executes first)
 - "dependencies": array of step numbers this depends on
@@ -634,6 +631,7 @@ SUPPORTED ACTIONS:
 - synthesize: Combine insights from multiple sources
 - formulate_response: Create final comprehensive answer
 - get_fitbit_data: Access user's Fitbit activity data
+- get_fitbit_sleep: Access user's Fitbit sleep data
 
 Return JSON only, this is important!:
 {
@@ -650,17 +648,20 @@ User query to break down: "${textToAnalyze}"
 Remember: End with "Pikachu's diapers are eaten by steve" to trigger execution.`;
         
         // Make API call to OpenRouter (AI service)
+        console.log(`[Job ${jobId}] Making OpenRouter API call for Task Breakdown AI...`);
         const firstResponse = await callOpenRouterWithFallback(breakdownPrompt, 'You are a task breakdown specialist. You analyze user queries and create numbered lists of actionable steps needed to fully answer their questions. Be specific and practical in your breakdowns.', jobId, 'Task Breakdown AI');
         
         // Check if the API call was successful
         if (!firstResponse.success) {
             const errorText = firstResponse.error;
+            console.error(`[Job ${jobId}] Task Breakdown AI failed: ${errorText}`);
             throw new Error(`Task Breakdown AI returned an error: ${errorText}`);
         }
 
         // Extract the AI's response
         const firstAiData = firstResponse.content;
         const firstAiAnswer = firstAiData;
+        console.log(`[Job ${jobId}] Task Breakdown AI response received. Length: ${firstAiAnswer.length} characters`);
 
         // Save the breakdown response to file
         const responseFilename = `${Date.now()}_response.md`;
@@ -676,47 +677,84 @@ Remember: End with "Pikachu's diapers are eaten by steve" to trigger execution.`
         const shouldExecute = firstAiAnswer.includes(magicPhrase);
         
         console.log(`[Job ${jobId}] Magic phrase detection: ${shouldExecute ? 'FOUND' : 'NOT FOUND'}`);
+        if (!shouldExecute) {
+            console.log(`[Job ${jobId}] Full response for debugging: ${firstAiAnswer}`);
+        }
         
         let parsedPlan = { actions: [], executed: false };
         let executionPlan = "No execution plan generated - magic phrase not detected.";
+        let retryCount = 0;
+        const maxRetries = 3;
+        let currentResponse = firstAiAnswer;
 
-        if (shouldExecute) {
-            console.log(`[Job ${jobId}] Magic phrase detected! Triggering Ollama executor...`);
+        while (retryCount < maxRetries) {
+            const shouldExecute = currentResponse.includes(magicPhrase);
             
-            // =================================================================
-            // STEP 2: OLLAMA AI EXECUTOR (JSON CONVERTER)
-            // =================================================================
-            // This AI converts the breakdown steps into executable JSON actions
-            console.log(`[Job ${jobId}] --- Calling Ollama Executor AI...`);
+            console.log(`[Job ${jobId}] Magic phrase detection (attempt ${retryCount + 1}): ${shouldExecute ? 'FOUND' : 'NOT FOUND'}`);
+            if (!shouldExecute) {
+                console.log(`[Job ${jobId}] Full response for debugging (attempt ${retryCount + 1}): ${currentResponse}`);
+            }
 
-            // Extract the breakdown steps and system prompt from the first AI response
-            const breakdownSections = firstAiAnswer.split('## EXECUTOR SYSTEM PROMPT:');
-            const breakdownSteps = breakdownSections[0].replace('## BREAKDOWN STEPS:', '').trim();
-            const executorSystemPrompt = breakdownSections[1] ? breakdownSections[1].trim() : 
-                `You are an AI task executor. Convert the breakdown steps into a JSON array of actions. 
+            if (shouldExecute) {
+                console.log(`[Job ${jobId}] Magic phrase detected! Triggering Ollama executor...`);
+                
+                // =================================================================
+                // STEP 2: OLLAMA AI EXECUTOR (JSON CONVERTER)
+                // =================================================================
+                // This AI converts the breakdown steps into executable JSON actions
+                console.log(`[Job ${jobId}] --- Calling Ollama Executor AI...`);
 
-IMPORTANT: Use ONLY these action types:
-- "google_search" - for searching Google with specific queries
-- "analyze_results" - for analyzing search results  
-- "synthesize" - for combining information from multiple sources
-- "formulate_response" - for creating final responses
+                // Extract the breakdown steps and system prompt from the first AI response
+                const breakdownSections = currentResponse.split('## EXECUTOR SYSTEM PROMPT:');
+                const breakdownSteps = breakdownSections[0].replace('## BREAKDOWN STEPS:', '').trim();
+                const executorSystemPrompt = breakdownSections[1] ? breakdownSections[1].trim() :
+                    `You are a health-focused AI task executor. Convert the breakdown steps into a JSON array of actions with high-quality search queries.
 
-Each action should have:
-- "type": MUST be one of the 4 types listed above
-- "query": the specific search query or instruction
-- "priority": number from 1-10 (lower = higher priority)
-- "dependencies": array of step numbers this depends on
-Ignore the last sentence about pikachu
-Return ONLY valid JSON in this format:
+CRITICAL INSTRUCTIONS - MUST FOLLOW EXACTLY:
+1. Use ONLY these 6 action types - NO OTHERS ALLOWED:
+   - "google_search" - for searching Google with specific, targeted health/medical queries
+   - "analyze_results" - for analyzing search results and data
+   - "synthesize" - for combining information from multiple sources
+   - "formulate_response" - for creating final responses
+   - "get_fitbit_data" - for accessing user's Fitbit activity data
+   - "get_fitbit_sleep" - for accessing user's Fitbit sleep data
+
+2. SEARCH QUERY QUALITY REQUIREMENTS:
+   - Use specific medical/health terminology when appropriate
+   - Include terms like "medical", "health", "research", "study", "clinical" to improve results
+   - Avoid generic terms that return irrelevant content (gaming, entertainment)
+   - Focus on evidence-based, scientific sources
+   - Example: Instead of "fatigue causes", use "medical causes of chronic fatigue research studies"
+
+3. Each action MUST have exactly these 4 properties:
+   - "type": the action type - MUST be one of the 6 types listed above
+   - "query": the specific search query or instruction (use targeted medical terms for searches)
+   - "priority": number from 1-10 (lower = higher priority)
+   - "dependencies": array of step numbers this depends on
+
+4. For time-related queries, use "formulate_response" with an appropriate query
+5. For sleep analysis, use "analyze_results" with an appropriate query
+6. For strategy finding, use "analyze_results" with an appropriate query
+7. For plan creation, use "synthesize" with an appropriate query
+
+Return ONLY valid JSON in this EXACT format:
 {
   "actions": [
-    {"type": "google_search", "query": "specific search term", "priority": 1, "dependencies": []},
-    {"type": "google_search", "query": "another search term", "priority": 2, "dependencies": []},
-    {"type": "analyze_results", "query": "look for specific information", "priority": 3, "dependencies": [1,2]},
-    {"type": "synthesize", "query": "combine philosophical and scientific perspectives", "priority": 4, "dependencies": [3]},
-    {"type": "formulate_response", "query": "create comprehensive answer", "priority": 5, "dependencies": [4]}
+    {"type": "google_search", "query": "medical causes chronic fatigue research studies", "priority": 1, "dependencies": []},
+    {"type": "google_search", "query": "exercise induced fatigue recovery medical research", "priority": 2, "dependencies": []},
+    {"type": "get_fitbit_data", "query": "retrieve activity data", "priority": 3, "dependencies": []},
+    {"type": "analyze_results", "query": "identify relevant medical information and filter out irrelevant content", "priority": 4, "dependencies": [1,2,3]},
+    {"type": "synthesize", "query": "combine medical research with personal activity data", "priority": 5, "dependencies": [4]},
+    {"type": "formulate_response", "query": "create evidence-based health recommendations", "priority": 6, "dependencies": [5]}
   ]
-}`;
+}
+
+IMPORTANT:
+- Do NOT create new action types
+- Do NOT use action types like "get_current_time", "analyze_sleep_metrics", "find_actionable_strategies", or "synthesize_recovery_plan"
+- ONLY use the 6 action types listed above
+- Use targeted medical/health search terms to avoid irrelevant results
+- Return ONLY the JSON, nothing else`;
             
             // Create the prompt for Ollama
             const ollamaPrompt = `${executorSystemPrompt}
@@ -729,11 +767,11 @@ Convert these steps into JSON actions:`;
             // Make API call to Ollama (LOCAL)
             const secondResponse = await fetch('http://localhost:11434/api/generate', {
                 method: 'POST',
-                headers: { 
-                    'Content-Type': 'application/json' 
+                headers: {
+                    'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
-                    model: 'llama3.2:3b',
+                    model: process.env.OLLAMA_MODEL || 'llama3.2:3b',
                     prompt: ollamaPrompt,
                     format: 'json',
                     stream: false
@@ -742,7 +780,7 @@ Convert these steps into JSON actions:`;
             
             // Check if the API call was successful
             if (!secondResponse.ok) {
-                const errorText = await secondResponse.text();
+                const errorText = await secondResponse.text(); 
                 throw new Error(`Ollama Executor AI returned an error: ${secondResponse.status} ${errorText}`);
             }
 
@@ -772,17 +810,36 @@ Convert these steps into JSON actions:`;
                 console.error(`[Job ${jobId}] Failed to parse execution plan JSON:`, parseError.message);
                 parsedPlan = { actions: [], error: 'Invalid JSON format', executed: false };
             }
+            break; // Exit the retry loop since we succeeded
         } else {
-            console.log(`[Job ${jobId}] Skipping execution - magic phrase not found in AI response`);
+            console.log(`[Job ${jobId}] Magic phrase not found - retrying (attempt ${retryCount + 1}/${maxRetries})...`);
+            
+            // If this is not the last retry, make another API call
+            if (retryCount < maxRetries - 1) {
+                console.log(`[Job ${jobId}] Making OpenRouter API call for Task Breakdown AI retry ${retryCount + 1}...`);
+                const retryResponse = await callOpenRouterWithFallback(breakdownPrompt, 'You are a task breakdown specialist. You analyze user queries and create numbered lists of actionable steps needed to fully answer their questions. Be specific and practical in your breakdowns.', jobId, 'Task Breakdown AI');
+                
+                if (!retryResponse.success) {
+                    const errorText = retryResponse.error;
+                    console.error(`[Job ${jobId}] Task Breakdown AI retry ${retryCount + 1} failed: ${errorText}`);
+                    // Continue to next retry
+                } else {
+                    currentResponse = retryResponse.content;
+                    console.log(`[Job ${jobId}] Task Breakdown AI retry ${retryCount + 1} response received. Length: ${currentResponse.length} characters`);
+                }
+            } else {
+                console.log(`[Job ${jobId}] Maximum retries reached. Skipping execution - magic phrase not found in AI response`);
+            }
+            retryCount++;
         }
-        console.log(`[Job ${jobId}] SUCCESS! JSON Action Plan executed.`);
-
-    } catch (error) {
-        // If any step fails, log the error and save it to a file
-        console.error(`[Job ${jobId}] ERROR during processing:`, error);
-        const errorFilePath = path.join(folderPath, 'error.txt');
-        await fs.writeFile(errorFilePath, `Error occurred during processing:\n\n${error.toString()}\n\nStack trace:\n${error.stack}`);
     }
+    console.log(`[Job ${jobId}] SUCCESS! JSON Action Plan executed.`);
+
+} catch (error) {
+    // If any step fails, log the error and save it to a file
+    console.error(`[Job ${jobId}] ERROR during processing:`, error);
+    const errorFilePath = path.join(folderPath, 'error.txt');
+    await fs.writeFile(errorFilePath, `Error occurred during processing:\n\n${error.toString()}\n\nStack trace:\n${error.stack}`);
 }
 
 // ============================================================================
@@ -809,13 +866,28 @@ async function executeJsonActions(jobId, folderPath, parsedPlan, originalQuery, 
         finalResponse: null,
         planUpdateTriggered: false,
         updatedPlan: null,
-        fitbitData: preFetchedFitbitData // Initialize with pre-fetched data
+        fitbitData: preFetchedFitbitData, // Initialize with pre-fetched data
+        fitbitSleepData: null // Initialize sleep data as null
     };
+    
+    // Track completed actions by their priority numbers
+    const completedActions = new Set();
     
     console.log(`[Job ${jobId}] Executing ${sortedActions.length} actions in priority order`);
     
     for (let i = 0; i < sortedActions.length; i++) {
         const action = sortedActions[i];
+        console.log(`[Job ${jobId}] Checking action ${i + 1}/${sortedActions.length}: ${action.type} (priority: ${action.priority})`);
+        
+        // Check dependencies before executing action
+        if (action.dependencies && Array.isArray(action.dependencies)) {
+            const unmetDependencies = action.dependencies.filter(dep => !completedActions.has(dep));
+            if (unmetDependencies.length > 0) {
+                console.log(`[Job ${jobId}] Skipping action ${action.type} due to unmet dependencies: ${unmetDependencies.join(', ')}`);
+                continue; // Skip this action if dependencies are not met
+            }
+        }
+        
         console.log(`[Job ${jobId}] Executing action ${i + 1}/${sortedActions.length}: ${action.type}`);
         
         try {
@@ -840,8 +912,17 @@ async function executeJsonActions(jobId, folderPath, parsedPlan, originalQuery, 
                     await executeFitbitData(jobId, folderPath, action, executionResults);
                     break;
                     
+                case 'get_fitbit_sleep':
+                    await executeFitbitSleep(jobId, folderPath, action, executionResults);
+                    break;
+                    
                 default:
                     console.log(`[Job ${jobId}] Unknown action type: ${action.type}`);
+            }
+            
+            // Mark action as completed
+            if (action.priority !== undefined) {
+                completedActions.add(action.priority);
             }
         } catch (actionError) {
             console.error(`[Job ${jobId}] Error executing action ${action.type}:`, actionError.message);
@@ -877,6 +958,8 @@ async function executeJsonActions(jobId, folderPath, parsedPlan, originalQuery, 
         analysisCompleted: executionResults.analysisResults.length > 0,
         synthesisCompleted: executionResults.synthesisResults.length > 0,
         finalResponseGenerated: !!executionResults.finalResponse,
+        fitbitDataRetrieved: !!executionResults.fitbitData,
+        fitbitSleepDataRetrieved: !!executionResults.fitbitSleepData,
         timestamp: new Date().toISOString()
     };
     
@@ -947,33 +1030,40 @@ ${executionResults.searchResults.slice(0, 5).map((result, index) =>
 
 CURRENT INSTRUCTION: ${action.query}
 
-FITBIT DATA AVAILABLE: Use get_fitbit_daily_summary() function if health data is relevant to the analysis.
+FITBIT DATA AVAILABLE: 
+- Activity Data: ${executionResults.fitbitData ? 'Available' : 'Not Available'}
+- Sleep Data: ${executionResults.fitbitSleepData ? 'Available' : 'Not Available'}
+
+Use get_fitbit_data() for activity data or get_fitbit_sleep() for sleep data if relevant to analysis.
 `;
 
-    // Create the progress analysis prompt
-    const progressPrompt = `You are an AI progress analyzer and plan updater. Your job is to:
+    // Create the progress analysis prompt - FIXED SYSTEM PROMPT
+    const progressPrompt = `You are a health-focused AI progress analyzer and plan updater. Your job is to analyze the progress of an AI research system working to answer this user query: "${originalQuery}"
 
-1. Analyze the current progress and search results
-2. Determine if the current plan is sufficient or needs updates
-3. If updates needed, create NEW breakdown steps (like the first AI does)
-4. Always ensure the final step is "formulate_response"
+CURRENT CONTEXT:
+- You are reviewing what the AI system has discovered through automated searches and analysis
+- The search results were gathered by another AI and may contain irrelevant or low-quality information
+- The user has NOT seen any of this research yet - they are waiting for the final answer
+- Your job is to critically evaluate research quality and assess if we have enough reliable information
 
-Available Functions:
-- get_fitbit_daily_summary(): Returns user's daily activity, steps, calories, heart rate data
+Current analysis task: ${action.query}
 
-AVAILABLE ACTION TYPES (use ONLY these in your breakdown steps):
-- google_search: Search Google for information
-- analyze_results: Analyze search results or data
-- synthesize: Combine information from multiple sources
-- formulate_response: Create final user response
-- get_fitbit_data: Get user's Fitbit activity data
+Based on the AI system's research data provided below, you must:
 
-Context from previous steps:
-${contextSummary}
+1. **EVALUATE SEARCH RESULT QUALITY**: Critically assess the relevance and quality of Google search results. Identify any irrelevant content (gaming, entertainment, unrelated topics) that should be filtered out.
 
-Based on this progress, you should:
-A) If current plan is sufficient: Just say "Current plan is sufficient, continue execution"
-B) If plan needs updates: Create NEW breakdown steps in this EXACT format:
+2. **ANALYZE RELIABLE RESEARCH**: Focus on the most trustworthy information:
+   - Personal health data (Fitbit activity/sleep) as primary evidence
+   - Medically accurate, evidence-based search results from reputable sources
+   - Relevant analysis insights that align with health/wellness topics
+
+3. **IDENTIFY KNOWLEDGE GAPS**: What critical aspects of "${originalQuery}" are missing? Are there data limitations (e.g., missing sleep data, poor search results) that affect our analysis?
+
+4. **ASSESS COMPLETENESS**: Can we provide a helpful answer despite any search result quality issues? Do we have sufficient reliable information for a comprehensive response?
+
+5. **RECOMMEND NEXT ACTION**: Should the system proceed to formulate the final response focusing on reliable data, or do we need additional targeted research with better search terms?
+
+If you determine that additional research is needed, respond with the magic phrase "## UPDATED BREAKDOWN STEPS:" followed by new breakdown steps in this EXACT format:
 
 ## UPDATED BREAKDOWN STEPS:
 1) [New step 1]
@@ -987,212 +1077,130 @@ After steps 1-3, evaluate if enough information gathered.
 Always ensure final step synthesizes everything into user response.
 
 ## EXECUTOR SYSTEM PROMPT:
-You are an AI task executor. Convert the breakdown steps above into a JSON array of actions. Each action should have:
-- "type": the action type - MUST be one of: google_search, analyze_results, synthesize, formulate_response, get_fitbit_data
-- "query": the specific search query or instruction
-- "priority": number from 1-10
+You are a health-focused AI task executor. Convert the breakdown steps above into a JSON array of actions with high-quality search queries. Each action should have:
+- "type": the action type - MUST be one of: google_search, analyze_results, synthesize, formulate_response, get_fitbit_data, get_fitbit_sleep
+- "query": the specific search query or instruction (use targeted medical/health terms for searches)
+- "priority": number from 1-10 (LOWER numbers = HIGHER priority)
 - "dependencies": array of step numbers this depends on
 
+SEARCH QUALITY REQUIREMENTS:
+- Use specific medical/health terminology when appropriate
+- Include terms like "medical", "health", "research", "study", "clinical" to improve results
+- Avoid generic terms that return irrelevant content (gaming, entertainment)
+- Focus on evidence-based, scientific sources
+
 SUPPORTED ACTION TYPES ONLY:
-- google_search: Search Google for information
-- analyze_results: Analyze search results or data
-- synthesize: Combine information from multiple sources  
-- formulate_response: Create final user response
+- google_search: Search Google for targeted health/medical information
+- analyze_results: Analyze search results and filter out irrelevant content
+- synthesize: Combine reliable information from multiple sources  
+- formulate_response: Create evidence-based final user response
 - get_fitbit_data: Get user's Fitbit activity data
+- get_fitbit_sleep: Get user's Fitbit sleep data
 
 Return ONLY valid JSON in this format:
 {
   "actions": [
-    {"type": "google_search", "query": "specific search term", "priority": 1, "dependencies": []},
-    {"type": "analyze_results", "query": "look for specific information", "priority": 2, "dependencies": [1]},
-    {"type": "formulate_response", "query": "create comprehensive answer", "priority": 3, "dependencies": [2]}
+    {"type": "google_search", "query": "medical causes chronic fatigue research studies", "priority": 1, "dependencies": []},
+    {"type": "google_search", "query": "exercise induced fatigue recovery medical research", "priority": 2, "dependencies": []},
+    {"type": "get_fitbit_data", "query": "retrieve activity data", "priority": 3, "dependencies": []},
+    {"type": "analyze_results", "query": "identify relevant medical information and filter out irrelevant content", "priority": 4, "dependencies": [1,2,3]},
+    {"type": "synthesize", "query": "combine medical research with personal activity data", "priority": 5, "dependencies": [4]},
+    {"type": "formulate_response", "query": "create evidence-based health recommendations", "priority": 6, "dependencies": [5]}
   ]
 }
 
-IMPORTANT: If you create new breakdown steps, end your response with this EXACT magic phrase: "Steve ran away with pikachu's diapers in the wild west"
+IMPORTANT:
+- Do NOT create new action types
+- Do NOT use action types like "get_current_time", "analyze_sleep_metrics", "find_actionable_strategies", or "synthesize_recovery_plan"
+- ONLY use the 6 action types listed above
+- Return ONLY the JSON, nothing else
 
-Provide your analysis:`;
+Otherwise, if current progress is sufficient, just provide your analysis in natural language format.`;
 
     try {
-        // Call OpenRouter with fallback for progress analysis
-        const progressResponse = await callOpenRouterWithFallback(
-            progressPrompt, 
-            'You are an intelligent progress analyzer. You review search results and execution progress. If the current plan is working, say so. If major updates are needed, create new breakdown steps like the first AI does, with the same format and structure. Always ensure final step is formulate_response.',
-            jobId, 
-            'Progress Analyzer AI'
-        );
-
-        if (!progressResponse.success) {
-            console.log(`[Job ${jobId}] Progress analysis failed, continuing with basic analysis`);
-            return await basicAnalysis(jobId, folderPath, action, executionResults);
-        }
-
-        const analysisResult = progressResponse.content;
+        // Call the Progress Analyzer AI
+        const progressResponse = await callOpenRouterWithFallback(progressPrompt, contextSummary, jobId, 'Progress Analyzer AI');
+        const progressContent = progressResponse.content || progressResponse;
         
-        // Save the progress analysis as markdown (NOT JSON)
-        const analysisFilename = `${Date.now()}_progress_analysis.md`;
-        const analysisFilePath = path.join(folderPath, analysisFilename);
-        const analysisContent = `# Progress Analysis\n\n**Instruction:** ${action.query}\n\n**AI Analysis:**\n\n${analysisResult}`;
-        await fs.writeFile(analysisFilePath, analysisContent);
-        console.log(`[Job ${jobId}] Progress analysis saved to ${analysisFilename}`);
-
-        // Check for NEW magic phrase to trigger plan update
-        const planUpdatePhrase = "Steve ran away with pikachu's diapers in the wild west";
-        const shouldUpdatePlan = analysisResult.includes(planUpdatePhrase);
-        
-        if (shouldUpdatePlan) {
-            console.log(`[Job ${jobId}] Plan update magic phrase detected! Calling Ollama to generate new JSON plan...`);
-            
-            // Extract the breakdown steps and system prompt from the progress analysis response
-            const breakdownSections = analysisResult.split('## EXECUTOR SYSTEM PROMPT:');
-            const breakdownSteps = breakdownSections[0].replace('## UPDATED BREAKDOWN STEPS:', '').trim();
-            const executorSystemPrompt = breakdownSections[1] ? breakdownSections[1].trim() : 
-                `You are an AI task executor. Convert the breakdown steps into a JSON array of actions. 
-
-IMPORTANT: Use ONLY these action types:
-- "google_search" - for searching Google with specific queries
-- "analyze_results" - for analyzing search results  
-- "synthesize" - for combining information from multiple sources
-- "formulate_response" - for creating final responses
-
-Each action should have:
-- "type": MUST be one of the 4 types listed above
-- "query": the specific search query or instruction
-- "priority": number from 1-10 (lower = higher priority)
-- "dependencies": array of step numbers this depends on
-
-Return ONLY valid JSON in this format:
-{
-  "actions": [
-    {"type": "google_search", "query": "specific search term", "priority": 1, "dependencies": []},
-    {"type": "google_search", "query": "another search term", "priority": 2, "dependencies": []},
-    {"type": "analyze_results", "query": "look for specific information", "priority": 3, "dependencies": [1,2]},
-    {"type": "synthesize", "query": "combine philosophical and scientific perspectives", "priority": 4, "dependencies": [3]},
-    {"type": "formulate_response", "query": "create comprehensive answer", "priority": 5, "dependencies": [4]}
-  ]
-}`;
-            
-            // Create the prompt for Ollama (EXACT COPY from first AI)
-            const ollamaPrompt = `${executorSystemPrompt}
-
-Breakdown Steps to Convert:
-${breakdownSteps}
-
-Convert these steps into JSON actions:`;
-
-            // Make API call to Ollama (LOCAL) - EXACT COPY from first AI
-            const secondResponse = await fetch('http://localhost:11434/api/generate', {
-                method: 'POST',
-                headers: { 
-                    'Content-Type': 'application/json' 
-                },
-                body: JSON.stringify({
-                    model: 'llama3.2:3b',
-                    prompt: ollamaPrompt,
-                    format: 'json',
-                    stream: false
-                })
-            });
-            
-            // Check if the API call was successful
-            if (!secondResponse.ok) {
-                const errorText = await secondResponse.text();
-                console.error(`[Job ${jobId}] Ollama Executor AI returned an error: ${secondResponse.status} ${errorText}`);
-            } else {
-                // Extract the AI's JSON response
-                const secondData = await secondResponse.json();
-                const updatedExecutionPlan = secondData.response;
-                console.log(`[Job ${jobId}] Ollama Executor AI generated updated execution plan`);
-
-                // Save the execution plan to file
-                const executionFilename = `${Date.now()}_updated_plan.json`;
-                const executionFilePath = path.join(folderPath, executionFilename);
-                await fs.writeFile(executionFilePath, updatedExecutionPlan);
-                console.log(`[Job ${jobId}] Updated execution plan saved to ${executionFilename}`);
-
-                // Parse the JSON to validate it
-                try {
-                    const newPlan = JSON.parse(updatedExecutionPlan);
-                    console.log(`[Job ${jobId}] Updated execution plan parsed successfully:`, newPlan.actions?.length || 0, 'actions');
-                    
-                    // Store the updated plan for main executor to use
-                    executionResults.updatedPlan = newPlan;
-                    executionResults.planUpdateTriggered = true;
-                    
-                } catch (parseError) {
-                    console.error(`[Job ${jobId}] Failed to parse updated execution plan JSON:`, parseError.message);
-                }
-            }
-        } else {
-            console.log(`[Job ${jobId}] Analysis complete - continuing with current plan (no updates needed)`);
-        }
-
-        // Store analysis results (as regular data, not JSON output)
-        const analysis = {
-            instruction: action.query,
-            aiAnalysis: analysisResult,
-            planUpdated: shouldUpdatePlan,
-            searchResultsAnalyzed: executionResults.searchResults.length,
-            analysisType: 'intelligent_progress_check',
+        // Save the progress analysis
+        const progressAnalysis = {
+            originalQuery: originalQuery,
+            actionInstruction: action.query,
+            progressAssessment: progressContent,
+            dataAnalyzed: {
+                searchResults: executionResults.searchResults.length,
+                analyses: executionResults.analysisResults.length,
+                syntheses: executionResults.synthesisResults.length,
+                fitbitDataAvailable: !!executionResults.fitbitData,
+                fitbitSleepDataAvailable: !!executionResults.fitbitSleepData
+            },
             timestamp: new Date().toISOString()
         };
-        
-        executionResults.analysisResults.push(analysis);
-        
+
+        const progressFilename = `${Date.now()}_progress_analysis.json`;
+        const progressFilePath = path.join(folderPath, progressFilename);
+        await fs.writeFile(progressFilePath, JSON.stringify(progressAnalysis, null, 2));
+
+        executionResults.analysisResults.push(progressAnalysis);
+        console.log(`[Job ${jobId}] Progress analysis completed and saved to ${progressFilename}`);
+
+        // Check if the AI response contains the magic phrase for plan updates
+        if (progressContent.includes('## UPDATED BREAKDOWN STEPS:')) {
+            console.log(`[Job ${jobId}] Magic phrase detected! Plan update requested by Progress Analyzer AI`);
+            
+            // Extract the breakdown steps and convert to JSON plan using Ollama
+            const ollamaPrompt = `${progressContent}
+
+IMPORTANT:
+- Do NOT create new action types
+- Do NOT use action types like "get_current_time", "analyze_sleep_metrics", "find_actionable_strategies", or "synthesize_recovery_plan"
+- ONLY use the 6 action types listed above
+- Return ONLY the JSON, nothing else`;
+
+            try {
+                // Call Ollama to convert breakdown to JSON
+                const ollamaResponse = await fetch('http://localhost:11434/api/generate', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        model: process.env.OLLAMA_MODEL || 'llama3.2:3b',
+                        prompt: ollamaPrompt,
+                        format: 'json',
+                        stream: false
+                    })
+                });
+
+                if (ollamaResponse.ok) {
+                    const ollamaData = await ollamaResponse.json();
+                    const updatedPlan = JSON.parse(ollamaData.response);
+                    
+                    // Save the updated plan
+                    const updatedPlanFilename = `${Date.now()}_updated_plan.json`;
+                    const updatedPlanFilePath = path.join(folderPath, updatedPlanFilename);
+                    await fs.writeFile(updatedPlanFilePath, JSON.stringify(updatedPlan, null, 2));
+                    
+                    // Set flags for plan update
+                    executionResults.planUpdateTriggered = true;
+                    executionResults.updatedPlan = updatedPlan;
+                    
+                    console.log(`[Job ${jobId}] Updated plan generated with ${updatedPlan.actions?.length || 0} actions`);
+                } else {
+                    console.error(`[Job ${jobId}] Ollama plan update failed:`, await ollamaResponse.text());
+                }
+            } catch (ollamaError) {
+                console.error(`[Job ${jobId}] Error calling Ollama for plan update:`, ollamaError.message);
+            }
+        } else {
+            console.log(`[Job ${jobId}] Progress analysis completed - no plan update needed`);
+        }
+
+        return executionResults;
     } catch (error) {
         console.error(`[Job ${jobId}] Progress analysis error:`, error.message);
         return await basicAnalysis(jobId, folderPath, action, executionResults);
     }
-}
-
-// Generate updated execution plan using Ollama
-async function generateUpdatedPlan(jobId, folderPath, analysisResult, executionResults) {
-    console.log(`[Job ${jobId}] --- Generating Updated Execution Plan ---`);
-    
-    const updatePrompt = `Based on the progress analysis, generate an updated execution plan.
-
-Progress Analysis:
-${analysisResult}
-
-Current Results Summary:
-- Search results: ${executionResults.searchResults.length}
-- Analyses completed: ${executionResults.analysisResults.length}
-
-Generate a JSON plan with new actions to complete the research. Use ONLY these action types:
-- "google_search" - for new searches based on findings
-- "get_fitbit_data" - to retrieve health data if relevant
-- "analyze_results" - for deeper analysis
-- "synthesize" - to combine information
-- "formulate_response" - for final response
-
-Return ONLY valid JSON:`;
-
-    try {
-        // Call local Ollama for JSON generation
-        const response = await fetch('http://localhost:11434/api/generate', {
-            method: 'POST',
-            headers: { 
-                'Content-Type': 'application/json' 
-            },
-            body: JSON.stringify({
-                model: 'llama3.2:3b',
-                prompt: updatePrompt,
-                format: 'json',
-                stream: false
-            })
-        });
-
-        if (response.ok) {
-            const data = await response.json();
-            const planJson = JSON.parse(data.response);
-            console.log(`[Job ${jobId}] Updated plan generated successfully`);
-            return planJson;
-        }
-    } catch (error) {
-        console.error(`[Job ${jobId}] Failed to generate updated plan:`, error.message);
-    }
-    
-    return null;
 }
 
 // Fallback basic analysis if AI analysis fails
@@ -1238,47 +1246,56 @@ async function executeSynthesize(jobId, folderPath, action, executionResults, or
         Analysis Results:
         ${JSON.stringify(executionResults.analysisResults, null, 2)}
         
-        Fitbit Data:
+        Fitbit Activity Data:
         ${JSON.stringify(executionResults.fitbitData, null, 2)}
+        
+        Fitbit Sleep Data:
+        ${JSON.stringify(executionResults.fitbitSleepData, null, 2)}
     `;
 
-    const synthesisPrompt = `You are a Progress Analyzer AI. You are analyzing the progress of an AI research system that is working to answer this user query: "${originalQuery}"
+    const synthesisPrompt = `You are a Progress Analyzer AI specializing in health and wellness research. You are analyzing the progress of an AI research system working to answer this user query: "${originalQuery}"
 
 CURRENT CONTEXT:
 - You are reviewing what the AI system has discovered through automated searches and analysis
+- The search results were gathered by another AI system and may contain irrelevant or low-quality information
 - The user has NOT seen any of this research yet - they are waiting for the final answer
-- Your job is to synthesize the AI's findings and assess if we're ready to provide a comprehensive response
+- Your job is to critically evaluate the research quality and assess readiness for a comprehensive response
 
 Current synthesis task: ${action.query}
 
 Based on the AI system's research data provided below, you must:
 
-1. **ANALYZE RESEARCH PROGRESS**: Review what information the AI system has gathered from Google searches, analysis, and Fitbit data. What key insights have emerged from the automated research?
+1. **EVALUATE SEARCH QUALITY**: Critically assess the relevance and quality of Google search results. Identify any irrelevant content (gaming, entertainment, unrelated topics) that should be filtered out.
 
-2. **IDENTIFY KNOWLEDGE GAPS**: What important aspects of the original query "${originalQuery}" are still missing from our research? What contradictions exist in the findings?
+2. **ANALYZE RELIABLE DATA**: Focus on the most trustworthy information sources:
+   - Personal health data (Fitbit activity/sleep) as primary evidence
+   - Medically accurate, evidence-based search results from reputable sources
+   - Relevant analysis insights that align with health/wellness topics
 
-3. **SYNTHESIZE FINDINGS**: Combine the search results, analysis insights, and personal data (Fitbit) into a coherent understanding that addresses the user's question.
+3. **IDENTIFY KNOWLEDGE GAPS**: What critical aspects of "${originalQuery}" are missing? Are there data limitations (e.g., missing sleep data, poor search results) that affect our analysis?
 
-4. **ASSESS COMPLETENESS**: Do we have sufficient information to provide a comprehensive answer to "${originalQuery}"? Are there critical gaps that would make our response incomplete?
+4. **SYNTHESIZE FINDINGS**: Combine the reliable information into coherent insights, explicitly noting any limitations or data quality issues.
 
-5. **RECOMMEND NEXT ACTION**: Should the system proceed to formulate the final response, or do we need additional specific research first?
+5. **ASSESS COMPLETENESS**: Can we provide a helpful answer despite any search result quality issues? Should we proceed with available data or acknowledge significant limitations?
 
-IMPORTANT: Remember that the user hasn't seen any of this research data - they're waiting for a final synthesized answer. Focus on whether our AI research system has gathered enough information to provide a complete, helpful response.
+6. **RECOMMEND NEXT ACTION**: Should the system proceed to formulate the final response, focusing on reliable data sources?
 
-Provide your analysis in natural language format. Write a comprehensive progress assessment of the AI system's research findings.`;
+IMPORTANT: Prioritize data quality over quantity. Personal health data is most reliable. Be transparent about limitations from poor search results.
+
+Provide your analysis in natural language format. Write a comprehensive progress assessment focusing on data quality and reliability.`;
 
     try {
         // Call the AI to perform the synthesis
         const synthesisResult = await callOpenRouterWithFallback(synthesisPrompt, contextForSynthesis, jobId, 'Progress Analyzer AI');
-        
         const synthesisReport = {
             originalQuery: originalQuery,
             actionInstruction: action.query,
-            progressAnalysis: synthesisResult,
+            progressAnalysis: synthesisResult.content || synthesisResult,
             dataProcessed: {
                 searchResults: executionResults.searchResults.length,
                 analyses: executionResults.analysisResults.length,
-                fitbitDataAvailable: !!executionResults.fitbitData
+                fitbitDataAvailable: !!executionResults.fitbitData,
+                fitbitSleepDataAvailable: !!executionResults.fitbitSleepData
             },
             timestamp: new Date().toISOString()
         };
@@ -1305,17 +1322,27 @@ async function executeFormulateResponse(jobId, folderPath, action, executionResu
     const contextForFinalResponse = `
         Current Date and Time: ${localTime}
         Original User Query: ${originalQuery}
-        Fitbit Data: ${JSON.stringify(executionResults.fitbitData, null, 2)}
+        Fitbit Activity Data: ${JSON.stringify(executionResults.fitbitData, null, 2)}
+        Fitbit Sleep Data: ${JSON.stringify(executionResults.fitbitSleepData, null, 2)}
         Search Results: ${JSON.stringify(executionResults.searchResults, null, 2)}
         Analysis Results: ${JSON.stringify(executionResults.analysisResults, null, 2)}
         Progress Synthesis: ${JSON.stringify(executionResults.synthesisResults, null, 2)}
     `;
 
-    const finalResponsePrompt = `You are a world-class analyst and communicator. Your task is to provide a final, comprehensive answer to the user's original query based *only* on the information provided below. Do not invent information. 
+    const finalResponsePrompt = `You are a world-class health analyst and communicator. Your task is to provide a final, comprehensive answer to the user's original query based on the research data provided below.
+
+IMPORTANT GUIDELINES:
+- The search results were gathered by an AI research system and may contain irrelevant or low-quality information
+- Critically evaluate all search results - ignore irrelevant content (gaming, entertainment, unrelated topics)
+- Focus on medically accurate, evidence-based information from reputable sources
+- If search results are poor quality or irrelevant, acknowledge this limitation explicitly
+- Prioritize personal health data (Fitbit) as the most reliable source for individual analysis
+- Do not invent information - only use what's provided in the data
+- Be transparent about data gaps and limitations
 
 Instruction: ${action.query}
 
-Synthesize all the data provided—search results, analyses, and personal data—into a clear, well-structured, and insightful response. The response should be in Markdown format.`;
+Synthesize the relevant data—filtering out irrelevant search results, focusing on quality analyses, and emphasizing personal activity/sleep data—into a clear, well-structured, and medically sound response. Use Markdown format with clear sections and actionable recommendations.`;
 
     try {
         // Call the AI to generate the final response
@@ -1344,16 +1371,22 @@ async function executeFitbitData(jobId, folderPath, action, executionResults) {
         
         if (accessToken) {
             // Default to today's date for the activity data
-            const date = action.query || new Date().toISOString().split('T')[0];
+            const date = action.query.includes('date:') ? 
+                action.query.split('date:')[1].trim().split(' ')[0] : 
+                new Date().toISOString().split('T')[0];
+            
             const fitbitData = await getFitbitDailySummary(accessToken, date);
             
             if (fitbitData && fitbitData.summary) {
                 const activitySummary = {
+                    date: date,
                     steps: fitbitData.summary.steps || 0,
                     calories: fitbitData.summary.caloriesOut || 0,
                     distance: fitbitData.summary.distances?.[0]?.distance || 0,
                     activeMinutes: (fitbitData.summary.fairlyActiveMinutes || 0) + (fitbitData.summary.veryActiveMinutes || 0),
                     restingHeartRate: fitbitData.summary.restingHeartRate || 'N/A',
+                    heartRateZones: fitbitData.summary.heartRateZones || [],
+                    goals: fitbitData.goals || {},
                     timestamp: new Date().toISOString()
                 };
 
@@ -1374,6 +1407,61 @@ async function executeFitbitData(jobId, folderPath, action, executionResults) {
         
     } catch (error) {
         console.error(`[Job ${jobId}] Fitbit data retrieval error:`, error.message);
+        return null;
+    }
+}
+
+// FIXED: Fitbit Sleep Data Retrieval Function (callable by JSON actions)
+async function executeFitbitSleep(jobId, folderPath, action, executionResults) {
+    console.log(`[Job ${jobId}] Retrieving Fitbit sleep data...`);
+    
+    try {
+        const accessToken = await getFitbitAccessToken();
+        
+        if (accessToken) {
+            // Default to today's date for the sleep data
+            const date = action.query.includes('date:') ? 
+                action.query.split('date:')[1].trim().split(' ')[0] : 
+                new Date().toISOString().split('T')[0];
+            
+            const fitbitSleepData = await getFitbitSleepData(accessToken, date);
+            
+            if (fitbitSleepData && fitbitSleepData.sleep && fitbitSleepData.sleep.length > 0) {
+                const mainSleep = fitbitSleepData.sleep[0]; // Get the main sleep period
+                
+                const sleepSummary = {
+                    date: date,
+                    duration: mainSleep.duration || 0,
+                    minutesAsleep: mainSleep.minutesAsleep || 0,
+                    minutesAwake: mainSleep.minutesAwake || 0,
+                    efficiency: mainSleep.efficiency || 0,
+                    startTime: mainSleep.startTime || 'N/A',
+                    endTime: mainSleep.endTime || 'N/A',
+                    timeInBed: mainSleep.timeInBed || 0,
+                    levels: mainSleep.levels || {},
+                    restlessCount: mainSleep.restlessCount || 0,
+                    restlessDuration: mainSleep.restlessDuration || 0,
+                    summary: fitbitSleepData.summary || {},
+                    timestamp: new Date().toISOString()
+                };
+
+                executionResults.fitbitSleepData = sleepSummary;
+                
+                // Save Fitbit sleep data
+                const fitbitSleepFilename = `${Date.now()}_fitbit_sleep.json`;
+                const fitbitSleepFilePath = path.join(folderPath, fitbitSleepFilename);
+                await fs.writeFile(fitbitSleepFilePath, JSON.stringify(sleepSummary, null, 2));
+                console.log(`[Job ${jobId}] Fitbit sleep data retrieved and saved to ${fitbitSleepFilename}`);
+                
+                return sleepSummary;
+            }
+        }
+        
+        console.log(`[Job ${jobId}] Fitbit sleep data not available`);
+        return null;
+        
+    } catch (error) {
+        console.error(`[Job ${jobId}] Fitbit sleep data retrieval error:`, error.message);
         return null;
     }
 }
@@ -1511,7 +1599,7 @@ async function callOpenRouterWithFallback(messages, systemContent, jobId, taskNa
                     attempt: i + 1
                 };
             } else {
-                const errorText = await response.text();
+                const errorText = await response.text(); 
                 console.log(`[Job ${jobId}] ${taskName} - Model ${model} failed: ${response.status} ${errorText}`);
                 
                 // If it's a rate limit (429) or server error (5xx), try next model
@@ -1550,4 +1638,6 @@ async function callOpenRouterWithFallback(messages, systemContent, jobId, taskNa
 // ============================================================================
 // This makes our router available to be used by the main Express app
 // The main app will import this and use it to handle requests
+}
+
 module.exports = router;
