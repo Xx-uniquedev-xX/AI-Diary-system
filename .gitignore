@@ -40,3 +40,8 @@ ehthumbs.db
 Thumbs.db
 # internal plans
 plans.md
+
+sql_for_supabase.sql
+
+supabase_key.md
+.gitignore
