@@ -1,80 +1,98 @@
 # Sleep Diary AI - Health Tracking and Analysis System
 
 ## Overview
-This project is an AI-powered application designed to help users track their sleep patterns, health metrics, and daily routines. It integrates with Fitbit API for automatic data collection, analyzes user input through AI, and provides personalized recommendations for managing ADHD symptoms and improving overall well-being. Built with a modern stack including Node.js, Express, Supabase, and React, this system offers a comprehensive dashboard for monitoring health metrics, correlating them with diary entries, and generating actionable insights.
+Sleep Diary AI is a backend-focused Node.js/Express service that analyzes user input and Fitbit data to produce evidence-based sleep and health insights. It integrates:
+- OpenRouter (with model fallbacks) for analysis, synthesis, and JSON action execution
+- Supabase (server-side client with service-role key) for long‑term memory storage/search
+- Jina embeddings for semantic memory
+- Fitbit OAuth and data retrieval (activity and sleep)
+
+The server also saves job artifacts to disk for traceability.
 
 ## Key Features
 
-- **Fitbit Integration**: Automatically collects heart rate, sleep, activity, and other health metrics from a Pixel Watch 3 or compatible device.
-- **AI-Driven Analysis**: Uses OpenRouter API to process user diary entries and physiological data, identifying patterns and correlations for personalized guidance.
-- **Real-Time Monitoring**: Tracks and visualizes health metrics with time-series data storage in Supabase.
-- **Personalized Recommendations**: Generates tailored advice based on sleep quality, heart rate variability, and mood patterns.
-- **User Authentication**: Secure login with OAuth 2.0 support.
-- **Dashboard Visualization**: Clean UI for viewing health trends, sleep scores, and AI-generated insights.
-- **Rate Limiting**: Background polling service handles 150 requests per hour to stay within Fitbit API limits.
+- **JSON Action Executor**: Fixed action types only — `google_search`, `analyze_results`, `synthesize`, `formulate_response`, `get_fitbit_data`, `get_fitbit_sleep`.
+- **Model Fallbacks**: Text and JSON-native OpenRouter calls with configurable fallback model lists.
+- **Long‑Term Memory**: Supabase + Jina embeddings for storing and retrieving insights; memory context is injected automatically.
+- **Fitbit Integration**: OAuth flow, daily activity summary, and sleep data retrieval.
+- **Artifacts**: All steps (plans, analyses, syntheses, final responses, memory matches) saved under `ai/backend/api/ai_outputs/<jobId>/`.
 
 ## Technologies Used
 
-- **Frontend**: React.js with Tailwind CSS for responsive design
-- **Backend**: Node.js with Express.js for API endpoints
-- **Database**: Supabase for PostgreSQL-based storage with Row Level Security
-- **API Integration**: Fitbit API for health data, OpenRouter for AI processing
-- **Authentication**: Supabase Auth and OAuth 2.0
-- **Build Tools**: Webpack, Babel, ESLint
-- **Deployment**: Docker for containerization (optional)
+- **Backend**: Node.js + Express
+- **Storage/DB**: Supabase (PostgreSQL) via server-side client (service-role key only)
+- **Embeddings**: Jina (2000-dim vectors)
+- **AI**: OpenRouter API (text + JSON models with fallbacks)
+- **Search**: Google Custom Search (optional)
+- **Frontend**: Static files in `ai/frontend` (optional; no React/Tailwind in this repo)
 
 ## Getting Started
 
 ### Prerequisites
-- Node.js (v18 or higher)
-- npm or yarn
-- Supabase account with the database schema defined in `ai/sql_for_supabase.sql`
-- Fitbit developer account with credentials for OAuth 2.0 (Client ID and Secret)
-- Environment variables configured (see `.env.example`)
+- Node.js v18+
+- Supabase project (URL + service-role key)
+- API keys: OpenRouter, Jina
+- Optional: Google CSE (API key + CX) for `google_search`
+- Fitbit Developer credentials (Client ID/Secret) and redirect URL
 
 ### Installation
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/sleep-diary-ai.git
-   cd sleep-diary-ai
-   ```
+1) Install backend dependencies
+```bash
+cd ai/backend
+npm install
+```
 
-2. Install dependencies:
-   ```bash
-   npm install  # or yarn install
-   ```
+2) Environment variables (create `ai/.env`)
+```
+SUPABASE_URL=...
+SUPABASE_SERVICE_ROLE_KEY=...
 
-3. Set up environment variables:
-   - Create a `.env` file in the root directory with:
-     ```
-     SUPABASE_URL=your_supabase_url
-     SUPABASE_KEY=your_supabase_key
-     FITBIT_CLIENT_ID=your_fitbit_client_id
-     FITBIT_CLIENT_SECRET=your_fitbit_client_secret
-     JWT_SECRET=your_jwt_secret
-     PORT=3000  # or your preferred port
-     ```
-   - Reference the `.env.example` file for full details.
+OPENROUTER_API_KEY=...
+OPENROUTER_MODEL_1=...
+OPENROUTER_MODEL_2=...
+OPENROUTER_MODEL_3=...
+OPENROUTER_MODEL_4=...
+OPENROUTER_MODEL_5=...
 
-4. Initialize the database:
-   - Run the Supabase setup script (if needed):
-     ```bash
-     npx supabase db import ai/sql_for_supabase.sql
-     ```
-   - Ensure tables and RLS policies are applied.
+OPENROUTER_JSON_MODEL_1=...
+OPENROUTER_JSON_MODEL_2=...
+OPENROUTER_JSON_MODEL_3=...
+OPENROUTER_JSON_MODEL_4=...
+OPENROUTER_JSON_MODEL_5=...
+
+JINA_API_KEY=...
+
+# Optional for Google search
+GOOGLE_CSE_API_KEY=...
+GOOGLE_CSE_CX=...
+
+# Fitbit OAuth
+FITBIT_CLIENT_ID=...
+FITBIT_CLIENT_SECRET=...
+FITBIT_REDIRECT_URL=http://localhost:8040/api/auth/fitbit/callback
+
+# Server
+PORT=8040
+```
+
+3) Database
+- Apply the SQL schema files under `ai/` (e.g., `supabase_part1_core_tables.sql`, `supabase_part2_functions_indexes.sql`, `supabase_part3_no_rls.sql`).
+- This project uses a server-side Supabase client (service-role key only), no anon client.
 
 ### Running the Application
 
-1. Start the backend server:
-   ```bash
-   npm run dev  # or yarn dev
-   ```
+Start the backend server:
+```bash
+cd ai/backend
+npm start
+```
 
-2. Run the frontend development server:
-   ```bash
-   cd frontend
-   npm run dev  # or yarn dev
-   ```
+By default it serves:
+- API: `http://localhost:<PORT>/api`
+- Static frontend (if present): `http://localhost:<PORT>/`
 
-3. Access the application at `http://localhost:4200` (port may vary).
+Primary API routes include:
+- `POST /api/process-and-save`
+- `POST /api/memory/store`, `POST /api/memory/search`, `POST /api/memory/test-embedding`
+- `GET /api/auth/fitbit`, `GET /api/auth/fitbit/status`, `GET /api/auth/fitbit/callback`
