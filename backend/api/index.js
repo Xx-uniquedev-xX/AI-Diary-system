@@ -24,6 +24,83 @@ const OUTPUTS_DIR = path.join(__dirname, 'ai_outputs');
 fs.ensureDirSync(OUTPUTS_DIR);
 
 // ============================================================================
+// SUPABASE DATABASE CONNECTION (using aromabless pattern)
+// ============================================================================
+// Import Supabase clients using the proper pattern from aromabless project
+
+const { supabase, supabaseAdmin } = require('../lib/supabase.js');
+console.log('Supabase clients initialized successfully');
+
+// ============================================================================
+// AI SYSTEM PROMPT CONFIGURATION
+// ============================================================================
+// All AI system prompts can be overridden via environment variables.
+// For dynamic prompts, you can include tokens like {ORIGINAL_QUERY} and {ACTION_QUERY}
+
+// Parse "Key Insights to Remember" section from AI text output
+function parseKeyInsightsFromText(text) {
+  if (!text || typeof text !== 'string') return '';
+  const markerRegex = /(^|\n)\s*#+\s*Key Insights to Remember\s*:?\s*(\n|$)/i;
+  const markerMatch = text.match(markerRegex);
+  if (!markerMatch) return '';
+  const startIdx = (markerMatch.index ?? 0) + markerMatch[0].length;
+  const tail = text.slice(startIdx);
+  const lines = tail.split(/\r?\n/);
+  const insights = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    // Stop when a new section likely starts
+    if (/^#+\s+/.test(trimmed)) break;
+    // Collect bullet or numbered items
+    if (/^[-*]\s+/.test(trimmed) || /^\d+\)\s+/.test(trimmed) || /^\d+\.\s+/.test(trimmed)) {
+      insights.push(trimmed.replace(/^[-*]\s+/, '').replace(/^\d+[).]\s+/, ''));
+      continue;
+    }
+    // Allow a couple of continuation lines for previous bullet
+    if (insights.length > 0 && insights[insights.length - 1].length < 400) {
+      insights[insights.length - 1] += ' ' + trimmed;
+      continue;
+    }
+    // Otherwise, if we encounter non-bulleted content after some bullets, stop
+    if (insights.length > 0) break;
+  }
+  return insights.join('\n');
+}
+
+// Format memory matches for inclusion in AI context
+function formatMemoriesForContext(memories = []) {
+  if (!Array.isArray(memories) || memories.length === 0) return 'None';
+  return memories.slice(0, 5).map((m, i) => {
+    const snippet = (m.content || '').replace(/\s+/g, ' ').slice(0, 240);
+    const score = (typeof m.similarity === 'number') ? m.similarity.toFixed(3) : 'n/a';
+    return `${i + 1}. [${m.type || m.memory_type || 'memory'}] ${m.title || '(untitled)'} (sim=${score}) — ${snippet}`;
+  }).join('\n');
+}
+// which will be replaced at runtime.
+
+// Helper to render prompt templates with simple token replacement
+function renderPrompt(template, vars = {}) {
+  if (!template) return '';
+  return template
+    .replaceAll('{ORIGINAL_QUERY}', vars.originalQuery ?? '')
+    .replaceAll('{ACTION_QUERY}', vars.actionQuery ?? '')
+    .replaceAll('{ALLOWED_ACTIONS}', 'google_search, analyze_results, synthesize, formulate_response, get_fitbit_data, get_fitbit_sleep');
+}
+
+// Environment-configurable prompts
+const ENV_PROMPTS = {
+  breakdownSystem: process.env.AI_BREAKDOWN_SYSTEM_PROMPT || 'You are a task breakdown specialist. You analyze user queries and create numbered lists of actionable steps needed to fully answer their questions. Be specific and practical in your breakdowns.',
+  jsonExecutorSystem: process.env.AI_JSON_EXECUTOR_SYSTEM_PROMPT || '', // Optional override
+  progressAnalyzerSystem: process.env.AI_PROGRESS_ANALYZER_SYSTEM_PROMPT || '', // Optional template with tokens
+  synthesisSystem: process.env.AI_SYNTHESIS_SYSTEM_PROMPT || '', // Optional template with tokens
+  finalResponseSystem: process.env.AI_FINAL_RESPONSE_SYSTEM_PROMPT || '' // Optional template with tokens
+};
+
+// Retry configuration for JSON action executor
+const JSON_ACTION_MAX_RETRIES = parseInt(process.env.JSON_ACTION_MAX_RETRIES || '3', 10);
+
+// ============================================================================
 // GOOGLE SEARCH FUNCTIONALITY
 // ============================================================================
 // This function searches Google and returns relevant results
@@ -60,6 +137,240 @@ async function performGoogleSearch(query, apiKey, cseId) {
     // If something goes wrong with the search, log the error and return empty results
     console.error('Google Search Error:', error.response?.data || error.message);
     return [];
+  }
+}
+
+// ============================================================================
+// JINA EMBEDDINGS MEMORY SYSTEM
+// ============================================================================
+// Automatic memory management using Jina embeddings for semantic search
+
+// Jina API configuration from environment
+const JINA_API_KEY = process.env.JINA_API_KEY;
+const JINA_API_URL = process.env.JINA_API_URL || 'https://api.jina.ai/v1/embeddings';
+if (!JINA_API_KEY) {
+  console.warn('[Jina] Missing JINA_API_KEY in environment. Set it in ai/.env');
+}
+
+// Generate embeddings using Jina v4
+async function generateJinaEmbedding(text) {
+  try {
+    console.log(`Generating Jina embedding for text: "${text.substring(0, 100)}..."`);
+    
+    const data = {
+      "model": "jina-embeddings-v4",
+      "task": "text-matching",
+      "late_chunking": true,
+      "truncate": true,
+      "dimensions": 2000,  // Supabase pgvector limit
+      "input": [{ "text": text }]
+    };
+
+    const response = await fetch(JINA_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${JINA_API_KEY}`
+      },
+      body: JSON.stringify(data)
+    });
+
+    if (!response.ok) {
+      throw new Error(`Jina API error: ${response.status} ${response.statusText}`);
+    }
+
+    const result = await response.json();
+
+    if (result.data && result.data.length > 0) {
+      const item = result.data[0];
+      // Guard against multivector responses
+      if (item.embeddings) {
+        throw new Error('Jina returned multivector embeddings; disable return_multivector for this pipeline');
+      }
+      if (Array.isArray(item.embedding)) {
+        if (item.embedding.length !== 2000) {
+          throw new Error(`Unexpected embedding length ${item.embedding.length}; expected 2000`);
+        }
+        return item.embedding;
+      }
+    }
+    
+    throw new Error('No embedding data received from Jina API');
+    
+  } catch (error) {
+    console.error('Jina Embedding Error:', error.message);
+    return null;
+  }
+}
+
+// Simple UUID v4/v1 validator (RFC 4122 variants 1-5)
+function isValidUUID(str) {
+  return typeof str === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(str);
+}
+
+// Store memory with embedding in Supabase
+async function storeMemory(userId, memoryData) {
+  try {
+    const { title, content, memoryType, sourceType, sourceId, importance = 0.5 } = memoryData;
+    
+    // Generate embedding for the content
+    const embedding = await generateJinaEmbedding(content);
+    if (!embedding) {
+      throw new Error('Failed to generate embedding');
+    }
+    
+    // Extract keywords from content
+    const keywords = extractKeywords(content);
+    
+    // Validate userId is a UUID (matches ai_memories.usr_prof_id type)
+    if (!isValidUUID(userId)) {
+      throw new Error(`Invalid userId (expected UUID): ${userId}`);
+    }
+
+    // Build insert payload; only include source_id if it's a valid UUID
+    const insertPayload = {
+      usr_prof_id: userId,
+      memory_type: memoryType,
+      title: title,
+      content: content,
+      source_type: sourceType,
+      embedding: embedding,
+      keywords: keywords,
+      importance_score: importance
+    };
+
+    if (isValidUUID(sourceId)) {
+      insertPayload.source_id = sourceId;
+    }
+
+    // Store in Supabase ai_memories table
+    const { data, error } = await supabase
+      .from('ai_memories')
+      .insert(insertPayload)
+      .select()
+      .single();
+    
+    if (error) {
+      throw new Error(`Supabase insert error: ${error.message}`);
+    }
+    
+    console.log(`Memory stored successfully in Supabase: ${title}`);
+    return data;
+    
+  } catch (error) {
+    console.error('Store Memory Error:', error.message);
+    return null;
+  }
+}
+
+// Search memories using semantic similarity
+async function searchMemories(userId, queryText, threshold = 0.7, maxResults = 10) {
+  try {
+    // Generate embedding for the query
+    const queryEmbedding = await generateJinaEmbedding(queryText);
+    if (!queryEmbedding) {
+      throw new Error('Failed to generate query embedding');
+    }
+    
+    console.log(`Searching memories for user ${userId} with query: "${queryText}"`);
+    
+    // Call the PostgreSQL function we created in the schema
+    const { data, error } = await supabase
+      .rpc('search_memories_by_embedding', {
+        user_id: userId,
+        query_embedding: queryEmbedding,
+        similarity_threshold: threshold,
+        max_results: maxResults
+      });
+    
+    if (error) {
+      throw new Error(`Supabase search error: ${error.message}`);
+    }
+    
+    console.log(`Found ${data?.length || 0} similar memories`);
+    return data || [];
+    
+  } catch (error) {
+    console.error('Search Memories Error:', error.message);
+    return [];
+  }
+}
+
+// Extract keywords from text (simple implementation)
+function extractKeywords(text) {
+  // Remove common stop words and extract meaningful terms
+  const stopWords = new Set(['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should']);
+  
+  return text
+    .toLowerCase()
+    .replace(/[^\w\s]/g, ' ')
+    .split(/\s+/)
+    .filter(word => word.length > 2 && !stopWords.has(word))
+    .slice(0, 20); // Limit to top 20 keywords
+}
+
+// Get or create user profile ID from auth user ID
+async function getUserProfileId(authUserId) {
+  try {
+    // First, try to find existing profile
+    const { data: existingProfile, error: selectError } = await supabase
+      .from('usr_prof')
+      .select('id')
+      .eq('auth_user_id', authUserId)
+      .single();
+    
+    if (existingProfile) {
+      return existingProfile.id;
+    }
+    
+    // If no profile exists, create one
+    const { data: newProfile, error: insertError } = await supabase
+      .from('usr_prof')
+      .insert({
+        auth_user_id: authUserId,
+        bi_legal_name: 'User', // Default name
+        created_at: new Date().toISOString()
+      })
+      .select('id')
+      .single();
+    
+    if (insertError) {
+      throw new Error(`Failed to create user profile: ${insertError.message}`);
+    }
+    
+    console.log(`Created new user profile for auth user: ${authUserId}`);
+    return newProfile.id;
+    
+  } catch (error) {
+    console.error('Get User Profile ID Error:', error.message);
+    return null;
+  }
+}
+
+// Auto-store important insights from AI processing
+async function autoStoreInsight(authUserId, insight, context = {}) {
+  try {
+    // Get the user's profile ID
+    const userId = await getUserProfileId(authUserId);
+    if (!userId) {
+      throw new Error('Failed to get user profile ID');
+    }
+    
+    const memoryData = {
+      title: `AI Insight: ${insight.substring(0, 50)}...`,
+      content: insight,
+      memoryType: 'insight',
+      sourceType: 'ai_analysis',
+      sourceId: context.jobId || null,
+      importance: context.importance || 0.7
+    };
+    
+    return await storeMemory(userId, memoryData);
+    
+  } catch (error) {
+    console.error('Auto Store Insight Error:', error.message);
+    return null;
   }
 }
 
@@ -449,6 +760,163 @@ router.get('/auth/fitbit/status', (req, res) => {
 });
 
 // ============================================================================
+// MEMORY MANAGEMENT ENDPOINTS
+// ============================================================================
+// API endpoints for storing and retrieving memories using Jina embeddings
+
+// Store a new memory
+// POST /memory/store with JSON body: {"title": "...", "content": "...", "memoryType": "...", "userId": "..."}
+router.post('/memory/store', async (req, res) => {
+  try {
+    const { title, content, memoryType, userId, sourceType, sourceId, importance } = req.body;
+    
+    if (!title || !content || !memoryType || !userId) {
+      return res.status(400).json({
+        error: 'Missing required fields: title, content, memoryType, userId'
+      });
+    }
+    
+    const memoryData = {
+      title,
+      content,
+      memoryType,
+      sourceType: sourceType || 'user_input',
+      sourceId,
+      importance: importance || 0.5
+    };
+    
+    const result = await storeMemory(userId, memoryData);
+    
+    if (result) {
+      res.json({
+        success: true,
+        message: 'Memory stored successfully',
+        memoryId: result.id || 'generated',
+        embedding_dimensions: result.embedding ? result.embedding.length : 0
+      });
+    } else {
+      res.status(500).json({
+        error: 'Failed to store memory'
+      });
+    }
+    
+  } catch (error) {
+    console.error('Store memory endpoint error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: error.message
+    });
+  }
+});
+
+// Search memories by semantic similarity
+// POST /memory/search with JSON body: {"query": "...", "userId": "...", "threshold": 0.7, "maxResults": 10}
+router.post('/memory/search', async (req, res) => {
+  try {
+    const { query, userId, threshold, maxResults } = req.body;
+    
+    if (!query || !userId) {
+      return res.status(400).json({
+        error: 'Missing required fields: query, userId'
+      });
+    }
+    
+    const results = await searchMemories(userId, query, threshold, maxResults);
+    
+    res.json({
+      success: true,
+      query: query,
+      results: results,
+      count: Array.isArray(results) ? results.length : 0
+    });
+    
+  } catch (error) {
+    console.error('Search memory endpoint error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: error.message
+    });
+  }
+});
+
+// Auto-store insight from AI processing
+// POST /memory/auto-insight with JSON body: {"insight": "...", "userId": "...", "jobId": "...", "importance": 0.7}
+router.post('/memory/auto-insight', async (req, res) => {
+  try {
+    const { insight, userId, jobId, importance } = req.body;
+    
+    if (!insight || !userId) {
+      return res.status(400).json({
+        error: 'Missing required fields: insight, userId'
+      });
+    }
+    
+    const context = {
+      jobId: jobId,
+      importance: importance || 0.7
+    };
+    
+    const result = await autoStoreInsight(userId, insight, context);
+    
+    if (result) {
+      res.json({
+        success: true,
+        message: 'Insight stored automatically',
+        memoryId: result.id || 'generated'
+      });
+    } else {
+      res.status(500).json({
+        error: 'Failed to auto-store insight'
+      });
+    }
+    
+  } catch (error) {
+    console.error('Auto-store insight endpoint error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: error.message
+    });
+  }
+});
+
+// Test Jina embedding generation
+// POST /memory/test-embedding with JSON body: {"text": "..."}
+router.post('/memory/test-embedding', async (req, res) => {
+  try {
+    const { text } = req.body;
+    
+    if (!text) {
+      return res.status(400).json({
+        error: 'Missing required field: text'
+      });
+    }
+    
+    const embedding = await generateJinaEmbedding(text);
+    
+    if (embedding) {
+      res.json({
+        success: true,
+        text: text,
+        embedding_dimensions: embedding.length,
+        embedding_preview: embedding.slice(0, 10), // First 10 dimensions for preview
+        message: `Successfully generated ${embedding.length}-dimensional embedding`
+      });
+    } else {
+      res.status(500).json({
+        error: 'Failed to generate embedding'
+      });
+    }
+    
+  } catch (error) {
+    console.error('Test embedding endpoint error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: error.message
+    });
+  }
+});
+
+// ============================================================================
 // MAIN AI PROCESSING ENDPOINT
 // ============================================================================
 // This is the heart of our application - it processes user questions with AI
@@ -459,6 +927,10 @@ router.post('/process-and-save', (req, res) => {
     // Extract the user's question from the request
     const userText = req.body.text;
     
+    // Read optional user context for memory operations
+    const { userId, authUserId } = req.body || {};
+    const userContext = { userProfileId: userId || null, authUserId: authUserId || 'dev-local-user' };
+
     // Create a unique job ID using current timestamp
     const jobId = Date.now().toString();
     
@@ -473,7 +945,7 @@ router.post('/process-and-save', (req, res) => {
     });
 
     // Start the processing in the background (async - doesn't block the response)
-    processAndCritique(jobId, jobFolderPath, userText);
+    processAndCritique(jobId, jobFolderPath, userText, userContext);
 });
 
 // ============================================================================
@@ -481,10 +953,23 @@ router.post('/process-and-save', (req, res) => {
 // ============================================================================
 // This function orchestrates the entire AI processing workflow
 
-async function processAndCritique(jobId, folderPath, textToAnalyze) {
+async function processAndCritique(jobId, folderPath, textToAnalyze, userContext = {}) {
     console.log(`[Job ${jobId}] Starting enhanced 3-step background processing with Google Search and Fitbit integration...`);
     
     try {
+        // Resolve user profile ID for memory operations
+        let effectiveUserProfileId = userContext?.userProfileId || null;
+        try {
+            if (!effectiveUserProfileId) {
+                effectiveUserProfileId = await getUserProfileId(userContext?.authUserId || 'dev-local-user');
+            }
+        } catch (e) {
+            console.error(`[Job ${jobId}] Failed to resolve user profile ID:`, e.message);
+        }
+        const normalizedUserContext = {
+            userProfileId: effectiveUserProfileId,
+            authUserId: userContext?.authUserId || 'dev-local-user'
+        };
         // =================================================================
         // STEP 0: GOOGLE SEARCH INTEGRATION (TEMPORARILY DISABLED)
         // =================================================================
@@ -575,6 +1060,8 @@ IMPORTANT CONTEXT:
 - User's Fitbit data is already available to the system if needed
 - Focus on logical sequencing: search → analyze → synthesize → respond
 - Prioritize high-quality, medically relevant search queries
+ - The system includes long-term memory (Supabase + Jina embeddings). It can store and retrieve memories with internal functions: storeMemory(userId, { title, content, ... }) and searchMemories(userId, query, threshold, maxResults).
+ - Do NOT create new memory-related action types. If recalling prior knowledge would help an action, mention it in that step's "query" text as context; keep the action type within the supported set.
 
 SEARCH QUERY GUIDELINES:
 - Use specific medical/health terminology when appropriate
@@ -583,19 +1070,22 @@ SEARCH QUERY GUIDELINES:
 - Focus on evidence-based, scientific sources
 - Consider multiple perspectives (symptoms, causes, treatments, lifestyle factors)
 
-For the user query, create:
-1. A numbered list of research and analysis steps with high-quality search queries
-2. A system prompt for the JSON executor
+ For the user query, create:
+ 1. A numbered list of research and analysis steps with high-quality search queries
+ 2. A system prompt for the JSON executor
 
-VALID ACTION TYPES (use ONLY these):
-- google_search: Search Google for specific information (use targeted medical/health terms)
-- analyze_results: Analyze and extract insights from search results
-- synthesize: Combine information from multiple sources into coherent insights
-- formulate_response: Create final comprehensive answer
-- get_fitbit_data: Access user's activity data (steps, calories, heart rate, etc.)
-- get_fitbit_sleep: Access user's sleep data (duration, efficiency, stages, etc.)
+ VALID ACTION TYPES (only these action types are allowed; memory functions are internal, not action types):
+ - google_search: Search Google for specific information (use targeted medical/health terms)
+ - analyze_results: Analyze and extract insights from search results
+ - synthesize: Combine information from multiple sources into coherent insights
+ - formulate_response: Create final comprehensive answer
+ - get_fitbit_data: Access user's activity data (steps, calories, heart rate, etc.)
+ - get_fitbit_sleep: Access user's sleep data (duration, efficiency, stages, etc.)
 
-IMPORTANT: End with this EXACT phrase: "Pikachu's diapers are eaten by steve"
+ MEMORY AWARENESS:
+ - The backend provides long-term memory functions (storeMemory(userId, {...}) and searchMemories(userId, query, threshold, maxResults)).
+ - Do NOT add memory action types. If prior memories would help, state that in the action's "query" (e.g., "include relevant prior memories about [X]"); the system will handle retrieval/storage internally.
+ IMPORTANT: End with this EXACT phrase: "Pikachu's diapers are eaten by steve"
 
 ## BREAKDOWN STEPS:
 1) [First research step]
@@ -633,6 +1123,10 @@ SUPPORTED ACTIONS:
 - get_fitbit_data: Access user's Fitbit activity data
 - get_fitbit_sleep: Access user's Fitbit sleep data
 
+MEMORY AWARENESS:
+- The backend has long-term memory functions available (storeMemory(userId, {...}) and searchMemories(userId, query, threshold, maxResults)).
+- Do NOT create memory-related action types. If recalling prior knowledge would improve an action, mention this in the action's "query" text (e.g., "include relevant prior memories about X"). The system will handle retrieval internally.
+
 Return JSON only, this is important!:
 {
   "actions": [
@@ -649,7 +1143,12 @@ Remember: End with "Pikachu's diapers are eaten by steve" to trigger execution.`
         
         // Make API call to OpenRouter (AI service)
         console.log(`[Job ${jobId}] Making OpenRouter API call for Task Breakdown AI...`);
-        const firstResponse = await callOpenRouterWithFallback(breakdownPrompt, 'You are a task breakdown specialist. You analyze user queries and create numbered lists of actionable steps needed to fully answer their questions. Be specific and practical in your breakdowns.', jobId, 'Task Breakdown AI');
+        const firstResponse = await callOpenRouterWithFallback(
+            breakdownPrompt,
+            ENV_PROMPTS.breakdownSystem,
+            jobId,
+            'Task Breakdown AI'
+        );
         
         // Check if the API call was successful
         if (!firstResponse.success) {
@@ -696,18 +1195,18 @@ Remember: End with "Pikachu's diapers are eaten by steve" to trigger execution.`
             }
 
             if (shouldExecute) {
-                console.log(`[Job ${jobId}] Magic phrase detected! Triggering Ollama executor...`);
+                console.log(`[Job ${jobId}] Magic phrase detected! Triggering OpenRouter JSON executor...`);
                 
                 // =================================================================
-                // STEP 2: OLLAMA AI EXECUTOR (JSON CONVERTER)
+                // STEP 2: OPENROUTER JSON EXECUTOR (JSON CONVERTER)
                 // =================================================================
                 // This AI converts the breakdown steps into executable JSON actions
-                console.log(`[Job ${jobId}] --- Calling Ollama Executor AI...`);
+                console.log(`[Job ${jobId}] --- Calling OpenRouter JSON Executor...`);
 
                 // Extract the breakdown steps and system prompt from the first AI response
                 const breakdownSections = currentResponse.split('## EXECUTOR SYSTEM PROMPT:');
                 const breakdownSteps = breakdownSections[0].replace('## BREAKDOWN STEPS:', '').trim();
-                const executorSystemPrompt = breakdownSections[1] ? breakdownSections[1].trim() :
+                let executorSystemPrompt = breakdownSections[1] ? breakdownSections[1].trim() :
                     `You are a health-focused AI task executor. Convert the breakdown steps into a JSON array of actions with high-quality search queries.
 
 CRITICAL INSTRUCTIONS - MUST FOLLOW EXACTLY:
@@ -737,6 +1236,10 @@ CRITICAL INSTRUCTIONS - MUST FOLLOW EXACTLY:
 6. For strategy finding, use "analyze_results" with an appropriate query
 7. For plan creation, use "synthesize" with an appropriate query
 
+MEMORY AWARENESS:
+- The backend provides long-term memory functions: storeMemory(userId, {...}) and searchMemories(userId, query, threshold, maxResults).
+- Do NOT introduce new memory-related action types. If recalling prior knowledge would improve an action, state this explicitly in that action's "query" (e.g., "include relevant prior memories about [topic]"). The system will handle retrieval/storage internally.
+
 Return ONLY valid JSON in this EXACT format:
 {
   "actions": [
@@ -755,39 +1258,48 @@ IMPORTANT:
 - ONLY use the 6 action types listed above
 - Use targeted medical/health search terms to avoid irrelevant results
 - Return ONLY the JSON, nothing else`;
+
+                // Optional environment override for JSON Executor system prompt
+                if (ENV_PROMPTS.jsonExecutorSystem) {
+                    executorSystemPrompt = renderPrompt(ENV_PROMPTS.jsonExecutorSystem, { originalQuery: textToAnalyze });
+                }
             
-            // Create the prompt for Ollama
-            const ollamaPrompt = `${executorSystemPrompt}
+            // Create the user prompt for JSON conversion
+            const jsonUserPrompt = `Breakdown Steps to Convert:\n${breakdownSteps}\n\nConvert these steps into JSON actions.`;
 
-Breakdown Steps to Convert:
-${breakdownSteps}
-
-Convert these steps into JSON actions:`;
-
-            // Make API call to Ollama (LOCAL)
-            const secondResponse = await fetch('http://localhost:11434/api/generate', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
+            // Optional JSON schema to strictly guide output
+            const actionsJsonSchema = {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                    actions: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            additionalProperties: false,
+                            properties: {
+                                type: { type: 'string', enum: ['google_search','analyze_results','synthesize','formulate_response','get_fitbit_data','get_fitbit_sleep'] },
+                                query: { type: 'string' },
+                                priority: { type: 'integer', minimum: 1, maximum: 10 },
+                                dependencies: { type: 'array', items: { type: 'integer' } }
+                            },
+                            required: ['type','query','priority','dependencies']
+                        }
+                    }
                 },
-                body: JSON.stringify({
-                    model: process.env.OLLAMA_MODEL || 'llama3.2:3b',
-                    prompt: ollamaPrompt,
-                    format: 'json',
-                    stream: false
-                })
-            });
-            
-            // Check if the API call was successful
-            if (!secondResponse.ok) {
-                const errorText = await secondResponse.text(); 
-                throw new Error(`Ollama Executor AI returned an error: ${secondResponse.status} ${errorText}`);
+                required: ['actions']
+            };
+
+            // Make API call to OpenRouter JSON models
+            const jsonExec = await callOpenRouterJSONWithFallback(jsonUserPrompt, executorSystemPrompt, jobId, 'JSON Executor', actionsJsonSchema);
+
+            if (!jsonExec.success) {
+                throw new Error(jsonExec.error || 'OpenRouter JSON Executor failed');
             }
 
-            // Extract the AI's JSON response
-            const secondData = await secondResponse.json();
-            executionPlan = secondData.response;
-            console.log(`[Job ${jobId}] Ollama Executor AI generated execution plan`);
+            // Use parsed JSON directly
+            executionPlan = JSON.stringify(jsonExec.json, null, 2);
+            console.log(`[Job ${jobId}] OpenRouter JSON Executor generated execution plan (model: ${jsonExec.model})`);
 
             // Save the execution plan to file
             const executionFilename = `${Date.now()}_execution_plan.json`;
@@ -804,7 +1316,7 @@ Convert these steps into JSON actions:`;
                 // =================================================================
                 // STEP 3: EXECUTE JSON ACTIONS
                 // =================================================================
-                await executeJsonActions(jobId, folderPath, parsedPlan, textToAnalyze, fitbitData);
+                await executeJsonActions(jobId, folderPath, parsedPlan, textToAnalyze, fitbitData, normalizedUserContext);
                 
             } catch (parseError) {
                 console.error(`[Job ${jobId}] Failed to parse execution plan JSON:`, parseError.message);
@@ -817,7 +1329,12 @@ Convert these steps into JSON actions:`;
             // If this is not the last retry, make another API call
             if (retryCount < maxRetries - 1) {
                 console.log(`[Job ${jobId}] Making OpenRouter API call for Task Breakdown AI retry ${retryCount + 1}...`);
-                const retryResponse = await callOpenRouterWithFallback(breakdownPrompt, 'You are a task breakdown specialist. You analyze user queries and create numbered lists of actionable steps needed to fully answer their questions. Be specific and practical in your breakdowns.', jobId, 'Task Breakdown AI');
+                const retryResponse = await callOpenRouterWithFallback(
+                    breakdownPrompt,
+                    ENV_PROMPTS.breakdownSystem,
+                    jobId,
+                    'Task Breakdown AI'
+                );
                 
                 if (!retryResponse.success) {
                     const errorText = retryResponse.error;
@@ -834,12 +1351,12 @@ Convert these steps into JSON actions:`;
         }
     }
     console.log(`[Job ${jobId}] SUCCESS! JSON Action Plan executed.`);
-
 } catch (error) {
     // If any step fails, log the error and save it to a file
     console.error(`[Job ${jobId}] ERROR during processing:`, error);
     const errorFilePath = path.join(folderPath, 'error.txt');
     await fs.writeFile(errorFilePath, `Error occurred during processing:\n\n${error.toString()}\n\nStack trace:\n${error.stack}`);
+}
 }
 
 // ============================================================================
@@ -847,7 +1364,7 @@ Convert these steps into JSON actions:`;
 // ============================================================================
 // This function executes the JSON action plan generated by Ollama
 
-async function executeJsonActions(jobId, folderPath, parsedPlan, originalQuery, preFetchedFitbitData = null) {
+async function executeJsonActions(jobId, folderPath, parsedPlan, originalQuery, preFetchedFitbitData = null, userContext = {}) {
     console.log(`[Job ${jobId}] --- Starting JSON Action Execution ---`);
     
     if (!parsedPlan.actions || parsedPlan.actions.length === 0) {
@@ -869,87 +1386,126 @@ async function executeJsonActions(jobId, folderPath, parsedPlan, originalQuery, 
         fitbitData: preFetchedFitbitData, // Initialize with pre-fetched data
         fitbitSleepData: null // Initialize sleep data as null
     };
+    // Attach user context for memory operations
+    executionResults.userProfileId = userContext?.userProfileId || null;
+    executionResults.authUserId = userContext?.authUserId || null;
     
     // Track completed actions by their priority numbers
     const completedActions = new Set();
+    const attemptCounts = new Map(); // key: action priority (step number), value: attempts
     
-    console.log(`[Job ${jobId}] Executing ${sortedActions.length} actions in priority order`);
+    // Use a queue to support retries and deferrals due to dependencies
+    let queue = [...sortedActions];
+    console.log(`[Job ${jobId}] Executing ${queue.length} actions with retry logic (max ${JSON_ACTION_MAX_RETRIES} retries per action)`);
     
-    for (let i = 0; i < sortedActions.length; i++) {
-        const action = sortedActions[i];
-        console.log(`[Job ${jobId}] Checking action ${i + 1}/${sortedActions.length}: ${action.type} (priority: ${action.priority})`);
+    while (queue.length > 0) {
+        const action = queue.shift();
+        const stepNum = action.priority;
+        const attempts = attemptCounts.get(stepNum) || 0;
+        
+        console.log(`[Job ${jobId}] Considering action: ${action.type} (priority: ${action.priority}) attempt ${attempts + 1}/${JSON_ACTION_MAX_RETRIES}`);
         
         // Check dependencies before executing action
         if (action.dependencies && Array.isArray(action.dependencies)) {
             const unmetDependencies = action.dependencies.filter(dep => !completedActions.has(dep));
             if (unmetDependencies.length > 0) {
-                console.log(`[Job ${jobId}] Skipping action ${action.type} due to unmet dependencies: ${unmetDependencies.join(', ')}`);
-                continue; // Skip this action if dependencies are not met
+                if (attempts < JSON_ACTION_MAX_RETRIES) {
+                    attemptCounts.set(stepNum, attempts + 1);
+                    console.log(`[Job ${jobId}] Deferring action ${action.type} due to unmet dependencies: ${unmetDependencies.join(', ')} (retry ${attempts + 1}/${JSON_ACTION_MAX_RETRIES})`);
+                    queue.push(action); // re-queue for later
+                    continue;
+                } else {
+                    console.warn(`[Job ${jobId}] Skipping action ${action.type} after ${JSON_ACTION_MAX_RETRIES} retries due to unmet dependencies: ${unmetDependencies.join(', ')}`);
+                    continue;
+                }
             }
         }
-        
-        console.log(`[Job ${jobId}] Executing action ${i + 1}/${sortedActions.length}: ${action.type}`);
         
         try {
             switch (action.type) {
                 case 'google_search':
                     await executeGoogleSearch(jobId, folderPath, action, executionResults);
                     break;
-                    
                 case 'analyze_results':
                     await executeAnalyzeResults(jobId, folderPath, action, executionResults, originalQuery);
+                    if (executionResults.analysisInsights && executionResults.userProfileId) {
+                        await storeMemory(executionResults.userProfileId, {
+                            title: `AI Analysis Insight: ${originalQuery.substring(0, 50)}...`,
+                            content: executionResults.analysisInsights,
+                            memoryType: 'insight',
+                            sourceType: 'ai_analysis',
+                            sourceId: jobId,
+                            importance: 0.7
+                        });
+                    }
                     break;
-                    
                 case 'synthesize':
                     await executeSynthesize(jobId, folderPath, action, executionResults, originalQuery);
+                    if (executionResults.synthesisInsights && executionResults.userProfileId) {
+                        await storeMemory(executionResults.userProfileId, {
+                            title: `AI Synthesis Insight: ${originalQuery.substring(0, 50)}...`,
+                            content: executionResults.synthesisInsights,
+                            memoryType: 'insight',
+                            sourceType: 'ai_analysis',
+                            sourceId: jobId,
+                            importance: 0.8
+                        });
+                    }
                     break;
-                    
                 case 'formulate_response':
                     await executeFormulateResponse(jobId, folderPath, action, executionResults, originalQuery);
+                    if (executionResults.finalResponse) {
+                        const targetUserId = executionResults.userProfileId;
+                        if (targetUserId) {
+                            await storeMemory(targetUserId, {
+                                title: `AI Response: ${originalQuery.substring(0, 50)}...`,
+                                content: executionResults.finalResponse,
+                                memoryType: 'conversation',
+                                sourceType: 'ai_analysis',
+                                sourceId: jobId,
+                                importance: 0.6
+                            });
+                        }
+                    }
                     break;
-                    
                 case 'get_fitbit_data':
                     await executeFitbitData(jobId, folderPath, action, executionResults);
                     break;
-                    
                 case 'get_fitbit_sleep':
                     await executeFitbitSleep(jobId, folderPath, action, executionResults);
                     break;
-                    
                 default:
                     console.log(`[Job ${jobId}] Unknown action type: ${action.type}`);
             }
-            
             // Mark action as completed
             if (action.priority !== undefined) {
                 completedActions.add(action.priority);
             }
         } catch (actionError) {
-            console.error(`[Job ${jobId}] Error executing action ${action.type}:`, actionError.message);
+            const nextAttempts = attempts + 1;
+            if (nextAttempts < JSON_ACTION_MAX_RETRIES) {
+                attemptCounts.set(stepNum, nextAttempts);
+                console.error(`[Job ${jobId}] Error executing action ${action.type}: ${actionError.message}. Retrying (${nextAttempts}/${JSON_ACTION_MAX_RETRIES})...`);
+                queue.push(action);
+                continue;
+            } else {
+                console.error(`[Job ${jobId}] Action ${action.type} failed after ${JSON_ACTION_MAX_RETRIES} attempts: ${actionError.message}`);
+                // Do not requeue
+            }
         }
         
-        // Check if plan update was triggered during analysis
+        // If plan update was triggered, replace remaining queue with new plan's actions
         if (executionResults.planUpdateTriggered && executionResults.updatedPlan) {
-            console.log(`[Job ${jobId}] Plan update detected! Switching to new execution plan...`);
-            
-            // Replace remaining actions with new plan
-            const remainingIndex = i + 1;
-            const newActions = executionResults.updatedPlan.actions || [];
-            
-            console.log(`[Job ${jobId}] Replacing ${sortedActions.length - remainingIndex} remaining actions with ${newActions.length} new actions`);
-            
-            // Remove remaining old actions and add new ones
-            sortedActions.splice(remainingIndex, sortedActions.length - remainingIndex, ...newActions);
-            
-            // Reset the plan update flag
+            const newActions = (executionResults.updatedPlan.actions || []).sort((a, b) => (a.priority || 5) - (b.priority || 5));
+            console.log(`[Job ${jobId}] Plan update detected! Replacing remaining actions with ${newActions.length} new actions`);
+            queue = [...newActions];
+            attemptCounts.clear();
             executionResults.planUpdateTriggered = false;
-            
-            console.log(`[Job ${jobId}] Plan updated! Now executing ${sortedActions.length} total actions`);
         }
-        
-        // Small delay between actions to avoid rate limiting
-        await new Promise(resolve => setTimeout(resolve, 1000));
     }
+    
+    // Small delay between actions to avoid rate limiting
+    await new Promise(resolve => setTimeout(resolve, 1000));
     
     // Save execution summary
     const executionSummary = {
@@ -1014,6 +1570,20 @@ async function executeAnalyzeResults(jobId, folderPath, action, executionResults
 async function check_and_update_plan(jobId, folderPath, action, executionResults, originalQuery) {
     console.log(`[Job ${jobId}] --- Checking Progress and Updating Plan ---`);
     
+    // Optionally search long-term memories relevant to this step
+    let analysisMemMatches = [];
+    try {
+        if (executionResults.userProfileId) {
+            const memoryQuery = `${originalQuery} ${action.query}`.trim();
+            analysisMemMatches = await searchMemories(executionResults.userProfileId, memoryQuery, 0.7, 5);
+            // Save memory matches to file
+            const memFile = `${Date.now()}_memories_for_${action.query.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30)}.json`;
+            await fs.writeFile(path.join(folderPath, memFile), JSON.stringify(analysisMemMatches, null, 2));
+        }
+    } catch (e) {
+        console.warn(`[Job ${jobId}] Memory search (analysis) failed:`, e.message);
+    }
+
     // Prepare context from all previous steps
     const contextSummary = `
 ORIGINAL USER QUERY: "${originalQuery}"
@@ -1035,10 +1605,15 @@ FITBIT DATA AVAILABLE:
 - Sleep Data: ${executionResults.fitbitSleepData ? 'Available' : 'Not Available'}
 
 Use get_fitbit_data() for activity data or get_fitbit_sleep() for sleep data if relevant to analysis.
+
+RELEVANT LONG-TERM MEMORIES:
+${formatMemoriesForContext(analysisMemMatches)}
 `;
 
-    // Create the progress analysis prompt - FIXED SYSTEM PROMPT
-    const progressPrompt = `You are a health-focused AI progress analyzer and plan updater. Your job is to analyze the progress of an AI research system working to answer this user query: "${originalQuery}"
+    // Create the progress analysis prompt (env-overrideable)
+    const progressPrompt = ENV_PROMPTS.progressAnalyzerSystem
+        ? renderPrompt(ENV_PROMPTS.progressAnalyzerSystem, { originalQuery, actionQuery: action.query })
+        : `You are a health-focused AI progress analyzer and plan updater. Your job is to analyze the progress of an AI research system working to answer this user query: "${originalQuery}"
 
 CURRENT CONTEXT:
 - You are reviewing what the AI system has discovered through automated searches and analysis
@@ -1097,6 +1672,10 @@ SUPPORTED ACTION TYPES ONLY:
 - get_fitbit_data: Get user's Fitbit activity data
 - get_fitbit_sleep: Get user's Fitbit sleep data
 
+MEMORY AWARENESS:
+- Long-term memory functions exist (storeMemory, searchMemories). Do NOT create memory action types.
+- When prior knowledge would help, add a note in the action's "query" (e.g., "consult relevant prior memories about [X]") so the system can incorporate memories internally.
+
 Return ONLY valid JSON in this format:
 {
   "actions": [
@@ -1140,6 +1719,10 @@ Otherwise, if current progress is sufficient, just provide your analysis in natu
         const progressFilename = `${Date.now()}_progress_analysis.json`;
         const progressFilePath = path.join(folderPath, progressFilename);
         await fs.writeFile(progressFilePath, JSON.stringify(progressAnalysis, null, 2));
+
+        // Extract and attach key insights from progress assessment
+        const analysisInsights = parseKeyInsightsFromText(progressContent || '');
+        if (analysisInsights) executionResults.analysisInsights = analysisInsights;
 
         executionResults.analysisResults.push(progressAnalysis);
         console.log(`[Job ${jobId}] Progress analysis completed and saved to ${progressFilename}`);
@@ -1234,6 +1817,19 @@ async function executeSynthesize(jobId, folderPath, action, executionResults, or
 
     const localTime = new Date().toLocaleString('en-US', { timeZone: 'Asia/Singapore' });
 
+    // Optionally search long-term memories relevant to this step
+    let synthMemMatches = [];
+    try {
+        if (executionResults.userProfileId) {
+            const memoryQuery = `${originalQuery} ${action.query}`.trim();
+            synthMemMatches = await searchMemories(executionResults.userProfileId, memoryQuery, 0.7, 5);
+            const memFile = `${Date.now()}_memories_for_synthesis_${action.query.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30)}.json`;
+            await fs.writeFile(path.join(folderPath, memFile), JSON.stringify(synthMemMatches, null, 2));
+        }
+    } catch (e) {
+        console.warn(`[Job ${jobId}] Memory search (synthesis) failed:`, e.message);
+    }
+
     // Consolidate all gathered data for the synthesis AI
     const contextForSynthesis = `
         Current Date and Time: ${localTime}
@@ -1251,9 +1847,14 @@ async function executeSynthesize(jobId, folderPath, action, executionResults, or
         
         Fitbit Sleep Data:
         ${JSON.stringify(executionResults.fitbitSleepData, null, 2)}
+
+        Relevant Long-Term Memories:
+        ${JSON.stringify(synthMemMatches, null, 2)}
     `;
 
-    const synthesisPrompt = `You are a Progress Analyzer AI specializing in health and wellness research. You are analyzing the progress of an AI research system working to answer this user query: "${originalQuery}"
+    const synthesisPrompt = ENV_PROMPTS.synthesisSystem
+        ? renderPrompt(ENV_PROMPTS.synthesisSystem, { originalQuery, actionQuery: action.query })
+        : `You are a Progress Analyzer AI specializing in health and wellness research. You are analyzing the progress of an AI research system working to answer this user query: "${originalQuery}"
 
 CURRENT CONTEXT:
 - You are reviewing what the AI system has discovered through automated searches and analysis
@@ -1282,7 +1883,9 @@ Based on the AI system's research data provided below, you must:
 
 IMPORTANT: Prioritize data quality over quantity. Personal health data is most reliable. Be transparent about limitations from poor search results.
 
-Provide your analysis in natural language format. Write a comprehensive progress assessment focusing on data quality and reliability.`;
+Provide your analysis in natural language format. Write a comprehensive progress assessment focusing on data quality and reliability.
+
+At the end, add a short section titled "Key Insights to Remember" with 3-5 concise bullet points summarizing durable insights suitable for long-term memory storage.`;
 
     try {
         // Call the AI to perform the synthesis
@@ -1304,6 +1907,10 @@ Provide your analysis in natural language format. Write a comprehensive progress
         const synthesisFilePath = path.join(folderPath, synthesisFilename);
         await fs.writeFile(synthesisFilePath, JSON.stringify(synthesisReport, null, 2));
 
+        // Extract and attach key insights for later memory storage
+        const insights = parseKeyInsightsFromText(synthesisReport.progressAnalysis || '');
+        if (insights) executionResults.synthesisInsights = insights;
+
         executionResults.synthesisResults.push(synthesisReport);
         console.log(`[Job ${jobId}] Progress analysis completed and saved to ${synthesisFilename}`);
 
@@ -1318,6 +1925,19 @@ async function executeFormulateResponse(jobId, folderPath, action, executionResu
 
     const localTime = new Date().toLocaleString('en-US', { timeZone: 'Asia/Singapore' });
 
+    // Optionally search long-term memories relevant to this step
+    let finalMemMatches = [];
+    try {
+        if (executionResults.userProfileId) {
+            const memoryQuery = `${originalQuery} ${action.query}`.trim();
+            finalMemMatches = await searchMemories(executionResults.userProfileId, memoryQuery, 0.7, 5);
+            const memFile = `${Date.now()}_memories_for_final_${action.query.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30)}.json`;
+            await fs.writeFile(path.join(folderPath, memFile), JSON.stringify(finalMemMatches, null, 2));
+        }
+    } catch (e) {
+        console.warn(`[Job ${jobId}] Memory search (final) failed:`, e.message);
+    }
+
     // Consolidate all gathered data for the final response AI
     const contextForFinalResponse = `
         Current Date and Time: ${localTime}
@@ -1327,9 +1947,12 @@ async function executeFormulateResponse(jobId, folderPath, action, executionResu
         Search Results: ${JSON.stringify(executionResults.searchResults, null, 2)}
         Analysis Results: ${JSON.stringify(executionResults.analysisResults, null, 2)}
         Progress Synthesis: ${JSON.stringify(executionResults.synthesisResults, null, 2)}
+        Relevant Long-Term Memories: ${JSON.stringify(finalMemMatches, null, 2)}
     `;
 
-    const finalResponsePrompt = `You are a world-class health analyst and communicator. Your task is to provide a final, comprehensive answer to the user's original query based on the research data provided below.
+    const finalResponsePrompt = ENV_PROMPTS.finalResponseSystem
+        ? renderPrompt(ENV_PROMPTS.finalResponseSystem, { originalQuery, actionQuery: action.query })
+        : `You are a world-class health analyst and communicator. Your task is to provide a final, comprehensive answer to the user's original query based on the research data provided below.
 
 IMPORTANT GUIDELINES:
 - The search results were gathered by an AI research system and may contain irrelevant or low-quality information
@@ -1339,6 +1962,7 @@ IMPORTANT GUIDELINES:
 - Prioritize personal health data (Fitbit) as the most reliable source for individual analysis
 - Do not invent information - only use what's provided in the data
 - Be transparent about data gaps and limitations
+ - End with a short section titled "Key Insights to Remember" summarizing 3-5 durable, generally useful insights that should be stored for future reference.
 
 Instruction: ${action.query}
 
@@ -1356,6 +1980,23 @@ Synthesize the relevant data—filtering out irrelevant search results, focusing
         const responseFilePath = path.join(folderPath, responseFilename);
         await fs.writeFile(responseFilePath, finalAnswer);
         console.log(`[Job ${jobId}] Final answer generated and saved to ${responseFilename}`);
+
+        // Extract and store Key Insights from final response
+        try {
+            const finalInsights = parseKeyInsightsFromText(finalAnswer);
+            if (finalInsights && executionResults.userProfileId) {
+                await storeMemory(executionResults.userProfileId, {
+                    title: `AI Final Insights: ${originalQuery.substring(0, 50)}...`,
+                    content: finalInsights,
+                    memoryType: 'insight',
+                    sourceType: 'ai_analysis',
+                    sourceId: jobId,
+                    importance: 0.75
+                });
+            }
+        } catch (memErr) {
+            console.warn(`[Job ${jobId}] Storing final insights failed:`, memErr.message);
+        }
 
     } catch (error) {
         console.error(`[Job ${jobId}] Error during final response AI call:`, error.message);
@@ -1633,11 +2274,122 @@ async function callOpenRouterWithFallback(messages, systemContent, jobId, taskNa
     };
 }
 
+// JSON-specific OpenRouter fallback (native JSON when supported)
+async function callOpenRouterJSONWithFallback(messages, systemContent, jobId, taskName = 'AI JSON Task', jsonSchema = null) {
+    // Read JSON-capable model list from env
+    let jsonFallbackModels = [
+        process.env.OPENROUTER_JSON_MODEL_1,
+        process.env.OPENROUTER_JSON_MODEL_2,
+        process.env.OPENROUTER_JSON_MODEL_3,
+        process.env.OPENROUTER_JSON_MODEL_4,
+        process.env.OPENROUTER_JSON_MODEL_5
+    ].filter(model => model && model !== 'undefined');
+
+    // If none provided, fall back to the general list (best-effort)
+    if (jsonFallbackModels.length === 0) {
+        console.warn(`[Job ${jobId}] ${taskName} - No JSON model list found in env; using general fallback list`);
+        jsonFallbackModels = [
+            process.env.OPENROUTER_MODEL_1 || 'qwen/qwen3-30b-a3b:free',
+            process.env.OPENROUTER_MODEL_2 || 'microsoft/phi-3-mini-128k-instruct:free',
+            process.env.OPENROUTER_MODEL_3 || 'meta-llama/llama-3.1-8b-instruct:free',
+            process.env.OPENROUTER_MODEL_4 || 'google/gemma-2-9b-it:free',
+            process.env.OPENROUTER_MODEL_5 || 'mistralai/mistral-7b-instruct:free'
+        ].filter(model => model && model !== 'undefined');
+    }
+
+    console.log(`[Job ${jobId}] ${taskName} - JSON fallback models: ${jsonFallbackModels.length}`);
+
+    for (let i = 0; i < jsonFallbackModels.length; i++) {
+        const model = jsonFallbackModels[i];
+        console.log(`[Job ${jobId}] ${taskName} - Attempting JSON model ${i + 1}/${jsonFallbackModels.length}: ${model}`);
+
+        try {
+            const body = {
+                model: model,
+                messages: [
+                    { role: 'system', content: systemContent },
+                    { role: 'user', content: messages }
+                ]
+            };
+
+            // Prefer native JSON output when supported
+            if (jsonSchema && typeof jsonSchema === 'object') {
+                body.response_format = {
+                    type: 'json_schema',
+                    json_schema: {
+                        name: 'response',
+                        schema: jsonSchema,
+                        strict: true
+                    }
+                };
+            } else {
+                body.response_format = { type: 'json_object' };
+            }
+
+            const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(body)
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                const rawContent = data?.choices?.[0]?.message?.content;
+                const content = typeof rawContent === 'string' ? rawContent.trim() : JSON.stringify(rawContent || '');
+
+                try {
+                    const parsed = JSON.parse(content);
+                    console.log(`[Job ${jobId}] ${taskName} - SUCCESS with model: ${model}`);
+                    return {
+                        success: true,
+                        json: parsed,
+                        model: model,
+                        attempt: i + 1,
+                        raw: content
+                    };
+                } catch (parseErr) {
+                    console.log(`[Job ${jobId}] ${taskName} - Model ${model} returned non-JSON content, trying next model...`);
+                    // Try next model
+                    continue;
+                }
+            } else {
+                const errorText = await response.text();
+                console.log(`[Job ${jobId}] ${taskName} - Model ${model} failed: ${response.status} ${errorText}`);
+
+                if (response.status === 429 || response.status >= 500) {
+                    console.log(`[Job ${jobId}] ${taskName} - Rate limited/server error, trying next model...`);
+                    continue;
+                }
+
+                console.log(`[Job ${jobId}] ${taskName} - Client error, trying next model anyway...`);
+                continue;
+            }
+        } catch (fetchError) {
+            console.error(`[Job ${jobId}] ${taskName} - Network error with model ${model}:`, fetchError.message);
+            continue;
+        }
+
+        if (i < jsonFallbackModels.length - 1) {
+            console.log(`[Job ${jobId}] ${taskName} - Waiting 2 seconds before next attempt...`);
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+    }
+
+    console.error(`[Job ${jobId}] ${taskName} - ALL JSON MODELS FAILED after ${jsonFallbackModels.length} attempts`);
+    return {
+        success: false,
+        error: `All ${jsonFallbackModels.length} JSON fallback models failed`,
+        attempts: jsonFallbackModels.length
+    };
+}
+
 // ============================================================================
 // EXPORT THE ROUTER
 // ============================================================================
 // This makes our router available to be used by the main Express app
 // The main app will import this and use it to handle requests
-}
 
 module.exports = router;
