@@ -85,13 +85,48 @@ function renderPrompt(template, vars = {}) {
   return template
     .replaceAll('{ORIGINAL_QUERY}', vars.originalQuery ?? '')
     .replaceAll('{ACTION_QUERY}', vars.actionQuery ?? '')
-    .replaceAll('{ALLOWED_ACTIONS}', 'google_search, analyze_results, synthesize, formulate_response, get_fitbit_data, get_fitbit_sleep');
+    .replaceAll('{ALLOWED_ACTIONS}', 'google_search, analyze_results, synthesize, formulate_response, get_fitbit_data, get_fitbit_sleep, memory_search, memory_store');
 }
 
 // Environment-configurable prompts
 const ENV_PROMPTS = {
-  breakdownSystem: process.env.AI_BREAKDOWN_SYSTEM_PROMPT || 'You are a task breakdown specialist. You analyze user queries and create numbered lists of actionable steps needed to fully answer their questions. Be specific and practical in your breakdowns.',
-  jsonExecutorSystem: process.env.AI_JSON_EXECUTOR_SYSTEM_PROMPT || '', // Optional override
+  breakdownSystem: process.env.AI_BREAKDOWN_SYSTEM_PROMPT || 'You are a health-focused task breakdown specialist. Follow the user message strictly: output only the two sections (## BREAKDOWN STEPS: and ## EXECUTOR SYSTEM PROMPT:). Do not output JSON yourself. Focus on medical/health relevance and evidence-based queries. Append the exact magic phrase required by the user message.',
+  jsonExecutorSystem: process.env.AI_JSON_EXECUTOR_SYSTEM_PROMPT || `You are a health-focused AI task executor. Convert the breakdown steps above into a JSON array of actions with high-quality search queries.
+
+RULES:
+- Use ONLY these 8 action types — NO OTHERS: google_search, analyze_results, synthesize, formulate_response, get_fitbit_data, get_fitbit_sleep, memory_search, memory_store.
+- Priorities: lower numbers run earlier. Typical order: searches (1-3), analysis (after searches), synthesis (after analysis), final response (last).
+- For actions of type google_search, analyze_results, synthesize, formulate_response, memory_search, memory_store — include exactly these fields:
+  - "type" (one of the 8 types)
+  - "query" (string)
+  - "priority" (integer 1-10)
+  - "dependencies" (array of step numbers)
+- For get_fitbit_data and get_fitbit_sleep — include:
+  - "type", "priority", "dependencies" (no "query" is required)
+
+GOOGLE_SEARCH REQUIREMENTS:
+- Use targeted medical/health terms; include words like "medical", "health", "research", "study", "clinical" where helpful.
+- Focus on evidence-based sources and filter out irrelevant content.
+- Never include unrelated strings in any action or query.
+
+RETURN FORMAT:
+- Return ONLY valid JSON with the top-level object: { "actions": [...] }.
+- Do NOT include markdown fences or extra text.
+
+EXAMPLE OUTPUT:
+{
+  "actions": [
+    {"type": "google_search", "query": "medical causes of chronic fatigue research studies", "priority": 1, "dependencies": []},
+    {"type": "google_search", "query": "clinical guidelines evaluation of daytime sleepiness differential diagnosis", "priority": 2, "dependencies": []},
+    {"type": "get_fitbit_data", "priority": 3, "dependencies": []},
+    {"type": "get_fitbit_sleep", "priority": 4, "dependencies": []},
+    {"type": "memory_search", "query": "prior notes about fatigue workup or sleep apnea mention", "priority": 5, "dependencies": []},
+    {"type": "analyze_results", "query": "synthesize research and Fitbit metrics; filter out non-medical sources", "priority": 6, "dependencies": [1,2,3,4,5]},
+    {"type": "synthesize", "query": "integrate findings into a concise set of likely etiologies with evidence weight", "priority": 7, "dependencies": [6]},
+    {"type": "memory_store", "query": "Key insights about fatigue differentials and personal biometrics correlations", "priority": 8, "dependencies": [7]},
+    {"type": "formulate_response", "query": "produce final evidence-based guidance with next steps", "priority": 9, "dependencies": [7]}
+  ]
+}`,
   progressAnalyzerSystem: process.env.AI_PROGRESS_ANALYZER_SYSTEM_PROMPT || '', // Optional template with tokens
   synthesisSystem: process.env.AI_SYNTHESIS_SYSTEM_PROMPT || '', // Optional template with tokens
   finalResponseSystem: process.env.AI_FINAL_RESPONSE_SYSTEM_PROMPT || '' // Optional template with tokens
@@ -381,12 +416,79 @@ async function autoStoreInsight(authUserId, insight, context = {}) {
 // This is a security measure to protect personal information
 
 // In-memory storage for Fitbit access tokens
-// In a real production app, you'd store these in a database
+// Persisted in Supabase (table `fb_tokens`) for durability across restarts
 let fitbitTokens = {
   access_token: null,    // The key that lets us access Fitbit data
   refresh_token: null,   // Used to get new access tokens when they expire
-  expires_at: null       // When the current access token expires
+  expires_at: null,      // When the current access token expires (ms epoch)
+  scope: null,
+  token_type: null,
+  fitbit_user_id: null
 };
+
+// Resolve a usr_prof.id to persist tokens per user
+const DEV_AUTH_USER_ID = process.env.DEV_AUTH_USER_ID || 'dev-local-user';
+async function resolveUsrProfId() {
+  try {
+    const { data, error } = await supabaseAdmin
+      .rpc('create_user_profile_if_not_exists', {
+        p_auth_user_id: DEV_AUTH_USER_ID,
+        p_user_name: 'User'
+      });
+    if (error) throw error;
+    // Supabase RPC returns the UUID directly for scalar RETURNS UUID
+    return Array.isArray(data) ? data[0] : data;
+  } catch (e) {
+    console.error('resolveUsrProfId error:', e.message || e);
+    return null;
+  }
+}
+
+// Persist tokens to Supabase (idempotent upsert by usr_prof_id)
+async function upsertFitbitTokensDB(usrProfId, tokens) {
+  if (!usrProfId) return;
+  try {
+    const { error } = await supabaseAdmin.rpc('upsert_fb_tokens', {
+      p_usr_prof_id: usrProfId,
+      p_access_token: tokens.access_token,
+      p_refresh_token: tokens.refresh_token || null,
+      p_expires_at: new Date(tokens.expires_at).toISOString(),
+      p_scope: tokens.scope || null,
+      p_token_type: tokens.token_type || null,
+      p_fitbit_user_id: tokens.fitbit_user_id || null
+    });
+    if (error) throw error;
+  } catch (e) {
+    console.error('upsertFitbitTokensDB error:', e.message || e);
+  }
+}
+
+// Load tokens from Supabase into memory
+async function loadFitbitTokensDB(usrProfId) {
+  if (!usrProfId) return false;
+  try {
+    const { data, error } = await supabaseAdmin.rpc('get_fb_tokens', {
+      p_usr_prof_id: usrProfId
+    });
+    if (error) throw error;
+    const row = Array.isArray(data) ? data[0] : data;
+    if (row && row.access_token) {
+      fitbitTokens = {
+        access_token: row.access_token,
+        refresh_token: row.refresh_token,
+        expires_at: row.expires_at ? new Date(row.expires_at).getTime() : null,
+        scope: row.scope || null,
+        token_type: row.token_type || null,
+        fitbit_user_id: row.fitbit_user_id || null
+      };
+      return true;
+    }
+    return false;
+  } catch (e) {
+    console.error('loadFitbitTokensDB error:', e.message || e);
+    return false;
+  }
+}
 
 // PKCE (Proof Key for Code Exchange) is a security standard for OAuth
 // It prevents other apps from stealing our authorization codes
@@ -477,11 +579,18 @@ async function exchangeCodeForTokens(authorizationCode, state) {
       fitbitTokens = {
         access_token: response.data.access_token,
         refresh_token: response.data.refresh_token,
-        expires_at: Date.now() + (response.data.expires_in * 1000)  // Calculate expiration time
+        expires_at: Date.now() + (response.data.expires_in * 1000),  // ms epoch
+        scope: response.data.scope || null,
+        token_type: response.data.token_type || null,
+        fitbit_user_id: response.data.user_id || null
       };
       
       console.log('Fitbit tokens obtained successfully');
       console.log('Scopes granted:', response.data.scope);
+      
+      // Persist tokens to Supabase for durability
+      const usrProfId = await resolveUsrProfId();
+      await upsertFitbitTokensDB(usrProfId, fitbitTokens);
       
       // Clean up the temporary PKCE data
       delete global.fitbitPKCE;
@@ -530,8 +639,14 @@ async function refreshFitbitToken() {
       fitbitTokens = {
         access_token: response.data.access_token,
         refresh_token: response.data.refresh_token,
-        expires_at: Date.now() + (response.data.expires_in * 1000)
+        expires_at: Date.now() + (response.data.expires_in * 1000),
+        scope: response.data.scope || fitbitTokens.scope || null,
+        token_type: response.data.token_type || fitbitTokens.token_type || null,
+        fitbit_user_id: response.data.user_id || fitbitTokens.fitbit_user_id || null
       };
+      // Persist refresh results
+      const usrProfId = await resolveUsrProfId();
+      await upsertFitbitTokensDB(usrProfId, fitbitTokens);
       
       console.log('Fitbit token refreshed successfully');
       return fitbitTokens.access_token;
@@ -552,12 +667,21 @@ async function getFitbitAccessToken() {
     if (fitbitTokens.access_token && fitbitTokens.expires_at > Date.now() + 60000) {
       return fitbitTokens.access_token;
     }
-    
+
+    // Try loading from DB if not in memory
+    const usrProfId = await resolveUsrProfId();
+    if (usrProfId) {
+      await loadFitbitTokensDB(usrProfId);
+      if (fitbitTokens.access_token && fitbitTokens.expires_at > Date.now() + 60000) {
+        return fitbitTokens.access_token;
+      }
+    }
+
     // If token is expired but we have a refresh token, get a new one
     if (fitbitTokens.refresh_token) {
       return await refreshFitbitToken();
     }
-    
+
     // No valid tokens available - user needs to authorize again
     throw new Error('No valid Fitbit tokens available. Authorization required.');
   } catch (error) {
@@ -577,8 +701,8 @@ async function getFitbitDailySummary(accessToken, date = 'today') {
     // Format the date for Fitbit API (they want yyyy-MM-dd format)
     const targetDate = date === 'today' ?
       new Date().toISOString().split('T')[0] : date;
-
-    console.log(`Fetching Fitbit daily summary for: ${targetDate}`);
+    
+    // console.log(`Fetching Fitbit daily summary for: ${targetDate}`);
     
     // Make a request to the Fitbit API to get activity data
     const response = await axios.get(`https://api.fitbit.com/1/user/-/activities/date/${targetDate}.json`, {
@@ -954,7 +1078,7 @@ router.post('/process-and-save', (req, res) => {
 // This function orchestrates the entire AI processing workflow
 
 async function processAndCritique(jobId, folderPath, textToAnalyze, userContext = {}) {
-    console.log(`[Job ${jobId}] Starting enhanced 3-step background processing with Google Search and Fitbit integration...`);
+    console.log(`[Job ${jobId}] Starting processing pipeline...`);
     
     try {
         // Resolve user profile ID for memory operations
@@ -973,7 +1097,7 @@ async function processAndCritique(jobId, folderPath, textToAnalyze, userContext 
         // =================================================================
         // STEP 0: GOOGLE SEARCH INTEGRATION (TEMPORARILY DISABLED)
         // =================================================================
-        console.log(`[Job ${jobId}] --- Google search disabled for first turn...`);
+        // console.log(`[Job ${jobId}] --- Google search disabled for first turn...`);
         
         // Initialize variables for search results (empty for now)
         let searchResults = [];
@@ -982,7 +1106,7 @@ async function processAndCritique(jobId, folderPath, textToAnalyze, userContext 
         // =================================================================
         // STEP 0.5: FITBIT DATA INTEGRATION
         // =================================================================
-        console.log(`[Job ${jobId}] --- Fetching Fitbit daily activity summary...`);
+        // console.log(`[Job ${jobId}] --- Fetching Fitbit daily activity summary...`);
         
         // Initialize variables for Fitbit data
         let fitbitData = null;
@@ -1023,7 +1147,7 @@ async function processAndCritique(jobId, folderPath, textToAnalyze, userContext 
                         });
                     }
                     
-                    console.log(`[Job ${jobId}] Fitbit data retrieved successfully`);
+                    // console.log(`[Job ${jobId}] Fitbit data retrieved successfully`);
                 } else {
                     fitbitSummary = "Fitbit data could not be retrieved.";
                 }
@@ -1033,7 +1157,7 @@ async function processAndCritique(jobId, folderPath, textToAnalyze, userContext 
                 const fitbitFilePath = path.join(folderPath, fitbitFilename);
                 const fitbitFileContent = `# Fitbit Daily Activity Summary\n\nDate: ${new Date().toISOString().split('T')[0]}\n\n${fitbitSummary}\n\n## Raw Data\n\`\`\`json\n${JSON.stringify(fitbitData, null, 2)}\n\`\`\``;
                 await fs.writeFile(fitbitFilePath, fitbitFileContent);
-                console.log(`[Job ${jobId}] Fitbit data saved to ${fitbitFilename}`);
+                // console.log(`[Job ${jobId}] Fitbit data saved to ${fitbitFilename}`);
                 
             } else {
                 console.log(`[Job ${jobId}] Could not obtain Fitbit access token - authorization required`);
@@ -1052,40 +1176,25 @@ async function processAndCritique(jobId, folderPath, textToAnalyze, userContext 
         
         // Create task breakdown prompt - FIXED SYSTEM PROMPT
         const localTime = new Date().toLocaleString('en-US', { timeZone: 'Asia/Singapore' });
-        const breakdownPrompt = `You are a health-focused task breakdown specialist. The current date and time is ${localTime}. Your job is to analyze user health queries and break them down into clear, actionable steps for an AI research system to execute.
+        const breakdownPrompt = `You are a health-focused task breakdown specialist. The current date and time is ${localTime}. Your job is to analyze user health queries and break them down into clear, actionable steps for an AI research/execution system.
 
-IMPORTANT CONTEXT:
-- You are creating a plan for AI systems to execute, not for humans
-- The AI will search Google, analyze results, and synthesize information automatically
-- User's Fitbit data is already available to the system if needed
-- Focus on logical sequencing: search → analyze → synthesize → respond
-- Prioritize high-quality, medically relevant search queries
- - The system includes long-term memory (Supabase + Jina embeddings). It can store and retrieve memories with internal functions: storeMemory(userId, { title, content, ... }) and searchMemories(userId, query, threshold, maxResults).
- - Do NOT create new memory-related action types. If recalling prior knowledge would help an action, mention it in that step's "query" text as context; keep the action type within the supported set.
+OUTPUT FORMAT (STRICT):
+- Your message must contain exactly two sections in this order:
+  1) "## BREAKDOWN STEPS:" — a numbered list of concrete steps for the system to execute.
+  2) "## EXECUTOR SYSTEM PROMPT:" — the literal system prompt text that a second AI will use to convert the steps into JSON actions.
+- Do NOT output any JSON action plan yourself. Only the second AI will produce JSON.
+- Do NOT include extra sections or commentary outside these two sections.
+- Append this exact magic phrase on its own line at the very end: "Pikachu's diapers are eaten by steve"
+
+CONTEXT & CAPABILITIES:
+- The system can execute exactly 8 action types: google_search, analyze_results, synthesize, formulate_response, get_fitbit_data, get_fitbit_sleep, memory_search, memory_store.
+- Long-term memory is explicit via actions: use "memory_search" to retrieve relevant prior info and "memory_store" to persist important insights.
 
 SEARCH QUERY GUIDELINES:
-- Use specific medical/health terminology when appropriate
-- Include terms like "medical", "health", "research", "study" to improve result quality
-- Avoid generic terms that might return irrelevant content
-- Focus on evidence-based, scientific sources
-- Consider multiple perspectives (symptoms, causes, treatments, lifestyle factors)
-
- For the user query, create:
- 1. A numbered list of research and analysis steps with high-quality search queries
- 2. A system prompt for the JSON executor
-
- VALID ACTION TYPES (only these action types are allowed; memory functions are internal, not action types):
- - google_search: Search Google for specific information (use targeted medical/health terms)
- - analyze_results: Analyze and extract insights from search results
- - synthesize: Combine information from multiple sources into coherent insights
- - formulate_response: Create final comprehensive answer
- - get_fitbit_data: Access user's activity data (steps, calories, heart rate, etc.)
- - get_fitbit_sleep: Access user's sleep data (duration, efficiency, stages, etc.)
-
- MEMORY AWARENESS:
- - The backend provides long-term memory functions (storeMemory(userId, {...}) and searchMemories(userId, query, threshold, maxResults)).
- - Do NOT add memory action types. If prior memories would help, state that in the action's "query" (e.g., "include relevant prior memories about [X]"); the system will handle retrieval/storage internally.
- IMPORTANT: End with this EXACT phrase: "Pikachu's diapers are eaten by steve"
+- Use specific medical/health terminology when appropriate.
+- Include terms like "medical", "health", "research", "study", "clinical" to improve result quality.
+- Avoid generic, entertainment, or gaming-related terms.
+- Prefer evidence-based, scientific sources (guidelines, peer-reviewed studies).
 
 ## BREAKDOWN STEPS:
 1) [First research step]
@@ -1094,52 +1203,43 @@ SEARCH QUERY GUIDELINES:
 4) [Synthesis step]
 5) [Final response step]
 
-## PROGRESS CHECK:
-Ensure searches cover all aspects of the query before analysis.
-Verify synthesis can occur with available data before final response.
-Always end with formulate_response to create the user's answer.
-
 ## EXECUTOR SYSTEM PROMPT:
-You are an AI task executor. Convert the breakdown steps into a JSON array of actions.
+You are a health-focused AI task executor. Convert the breakdown steps above into a JSON array of actions with high-quality search queries.
 
-IMPORTANT PRIORITY RULES:
-- LOWER numbers = HIGHER priority (1 executes before 2)
-- Search actions: priority 1-3
-- Analysis actions: priority 4-5 (after searches complete)
-- Synthesis: priority 6 (after analysis)
-- Final response: priority 7 (last step)
+RULES:
+- Use ONLY these 8 action types — NO OTHERS: google_search, analyze_results, synthesize, formulate_response, get_fitbit_data, get_fitbit_sleep, memory_search, memory_store.
+- Priorities: lower numbers run earlier. Typical order: searches (1-3), analysis (after searches), synthesis (after analysis), final response (last).
+- For actions of type google_search, analyze_results, synthesize, formulate_response, memory_search, memory_store — include exactly these fields:
+  - "type" (one of the 8 types)
+  - "query" (string)
+  - "priority" (integer 1-10)
+  - "dependencies" (array of step numbers)
+- For get_fitbit_data and get_fitbit_sleep — include:
+  - "type", "priority", "dependencies" (no "query" is required)
 
-Each action needs:
-- "type": MUST be one of: google_search, analyze_results, synthesize, formulate_response, get_fitbit_data, get_fitbit_sleep
-- "query": specific instruction for that action
-- "priority": number 1-10 (lower = executes first)
-- "dependencies": array of step numbers this depends on
+GOOGLE_SEARCH REQUIREMENTS:
+- Use targeted medical/health terms; include words like "medical", "health", "research", "study", "clinical" where helpful.
+- Focus on evidence-based sources and filter out irrelevant content.
+- Never include unrelated strings (e.g., the magic phrase) in any action or query.
 
-SUPPORTED ACTIONS:
-- google_search: Search Google for information
-- analyze_results: Extract insights from search results and data
-- synthesize: Combine insights from multiple sources
-- formulate_response: Create final comprehensive answer
-- get_fitbit_data: Access user's Fitbit activity data
-- get_fitbit_sleep: Access user's Fitbit sleep data
+RETURN FORMAT:
+- Return ONLY valid JSON with the top-level object: { "actions": [...] }.
+- Do NOT include markdown fences or extra text.
 
-MEMORY AWARENESS:
-- The backend has long-term memory functions available (storeMemory(userId, {...}) and searchMemories(userId, query, threshold, maxResults)).
-- Do NOT create memory-related action types. If recalling prior knowledge would improve an action, mention this in the action's "query" text (e.g., "include relevant prior memories about X"). The system will handle retrieval internally.
-
-Return JSON only, this is important!:
+EXAMPLE OUTPUT:
 {
   "actions": [
-    {"type": "google_search", "query": "search term", "priority": 1, "dependencies": []},
-    {"type": "analyze_results", "query": "extract key insights", "priority": 4, "dependencies": [1,2,3]},
-    {"type": "synthesize", "query": "combine insights", "priority": 6, "dependencies": [4]},
-    {"type": "formulate_response", "query": "create final answer", "priority": 7, "dependencies": [5]}
+    {"type": "google_search", "query": "medical causes of chronic fatigue research studies", "priority": 1, "dependencies": []},
+    {"type": "google_search", "query": "clinical guidelines evaluation of daytime sleepiness differential diagnosis", "priority": 2, "dependencies": []},
+    {"type": "get_fitbit_data", "priority": 3, "dependencies": []},
+    {"type": "get_fitbit_sleep", "priority": 4, "dependencies": []},
+    {"type": "memory_search", "query": "prior notes about fatigue workup or sleep apnea mention", "priority": 5, "dependencies": []},
+    {"type": "analyze_results", "query": "synthesize research and Fitbit metrics; filter out non-medical sources", "priority": 6, "dependencies": [1,2,3,4,5]},
+    {"type": "synthesize", "query": "integrate findings into a concise set of likely etiologies with evidence weight", "priority": 7, "dependencies": [6]},
+    {"type": "memory_store", "query": "Key insights about fatigue differentials and personal biometrics correlations", "priority": 8, "dependencies": [7]},
+    {"type": "formulate_response", "query": "produce final evidence-based guidance with next steps", "priority": 9, "dependencies": [7]}
   ]
-}
-
-User query to break down: "${textToAnalyze}"
-
-Remember: End with "Pikachu's diapers are eaten by steve" to trigger execution.`;
+}`;
         
         // Make API call to OpenRouter (AI service)
         console.log(`[Job ${jobId}] Making OpenRouter API call for Task Breakdown AI...`);
@@ -1165,7 +1265,7 @@ Remember: End with "Pikachu's diapers are eaten by steve" to trigger execution.`
         // Save the breakdown response to file
         const responseFilename = `${Date.now()}_response.md`;
         const responseFilePath = path.join(folderPath, responseFilename);
-        const responseWithMetadata = `# AI Response\n\n**Original Query:** "${textToAnalyze}"\n\n**Search Results Included:** ${searchResults.length > 0 ? 'Yes' : 'No'}\n\n**Generated Response:**\n\n${firstAiAnswer}`;
+        const responseWithMetadata = `# AI Response\n\n**Original Query:** "${textToAnalyze}"\n\n**Generated Response:**\n\n${firstAiAnswer}`;
         await fs.writeFile(responseFilePath, responseWithMetadata);
         console.log(`[Job ${jobId}] Task Breakdown AI response saved to ${responseFilename}`);
 
@@ -1207,62 +1307,47 @@ Remember: End with "Pikachu's diapers are eaten by steve" to trigger execution.`
                 const breakdownSections = currentResponse.split('## EXECUTOR SYSTEM PROMPT:');
                 const breakdownSteps = breakdownSections[0].replace('## BREAKDOWN STEPS:', '').trim();
                 let executorSystemPrompt = breakdownSections[1] ? breakdownSections[1].trim() :
-                    `You are a health-focused AI task executor. Convert the breakdown steps into a JSON array of actions with high-quality search queries.
+                    `You are a health-focused AI task executor. Convert the breakdown steps above into a JSON array of actions with high-quality search queries.
 
-CRITICAL INSTRUCTIONS - MUST FOLLOW EXACTLY:
-1. Use ONLY these 6 action types - NO OTHERS ALLOWED:
-   - "google_search" - for searching Google with specific, targeted health/medical queries
-   - "analyze_results" - for analyzing search results and data
-   - "synthesize" - for combining information from multiple sources
-   - "formulate_response" - for creating final responses
-   - "get_fitbit_data" - for accessing user's Fitbit activity data
-   - "get_fitbit_sleep" - for accessing user's Fitbit sleep data
+RULES:
+- Use ONLY these 8 action types — NO OTHERS: google_search, analyze_results, synthesize, formulate_response, get_fitbit_data, get_fitbit_sleep, memory_search, memory_store.
+- Priorities: lower numbers run earlier. Typical order: searches (1-3), analysis (after searches), synthesis (after analysis), final response (last).
+- For actions of type google_search, analyze_results, synthesize, formulate_response, memory_search, memory_store — include exactly these fields:
+  - "type" (one of the 8 types)
+  - "query" (string)
+  - "priority" (integer 1-10)
+  - "dependencies" (array of step numbers)
+- For get_fitbit_data and get_fitbit_sleep — include:
+  - "type", "priority", "dependencies" (no "query" is required)
 
-2. SEARCH QUERY QUALITY REQUIREMENTS:
-   - Use specific medical/health terminology when appropriate
-   - Include terms like "medical", "health", "research", "study", "clinical" to improve results
-   - Avoid generic terms that return irrelevant content (gaming, entertainment)
-   - Focus on evidence-based, scientific sources
-   - Example: Instead of "fatigue causes", use "medical causes of chronic fatigue research studies"
+GOOGLE_SEARCH REQUIREMENTS:
+- Use targeted medical/health terms; include words like "medical", "health", "research", "study", "clinical" where helpful.
+- Focus on evidence-based sources and filter out irrelevant content.
+- Never include unrelated strings (e.g., the magic phrase) in any action or query.
 
-3. Each action MUST have exactly these 4 properties:
-   - "type": the action type - MUST be one of the 6 types listed above
-   - "query": the specific search query or instruction (use targeted medical terms for searches)
-   - "priority": number from 1-10 (lower = higher priority)
-   - "dependencies": array of step numbers this depends on
+RETURN FORMAT:
+- Return ONLY valid JSON with the top-level object: { "actions": [...] }.
+- Do NOT include markdown fences or extra text.
 
-4. For time-related queries, use "formulate_response" with an appropriate query
-5. For sleep analysis, use "analyze_results" with an appropriate query
-6. For strategy finding, use "analyze_results" with an appropriate query
-7. For plan creation, use "synthesize" with an appropriate query
-
-MEMORY AWARENESS:
-- The backend provides long-term memory functions: storeMemory(userId, {...}) and searchMemories(userId, query, threshold, maxResults).
-- Do NOT introduce new memory-related action types. If recalling prior knowledge would improve an action, state this explicitly in that action's "query" (e.g., "include relevant prior memories about [topic]"). The system will handle retrieval/storage internally.
-
-Return ONLY valid JSON in this EXACT format:
+EXAMPLE OUTPUT:
 {
   "actions": [
-    {"type": "google_search", "query": "medical causes chronic fatigue research studies", "priority": 1, "dependencies": []},
-    {"type": "google_search", "query": "exercise induced fatigue recovery medical research", "priority": 2, "dependencies": []},
-    {"type": "get_fitbit_data", "query": "retrieve activity data", "priority": 3, "dependencies": []},
-    {"type": "analyze_results", "query": "identify relevant medical information and filter out irrelevant content", "priority": 4, "dependencies": [1,2,3]},
-    {"type": "synthesize", "query": "combine medical research with personal activity data", "priority": 5, "dependencies": [4]},
-    {"type": "formulate_response", "query": "create evidence-based health recommendations", "priority": 6, "dependencies": [5]}
+    {"type": "google_search", "query": "medical research overtraining syndrome symptoms and recovery", "priority": 1, "dependencies": []},
+    {"type": "google_search", "query": "impact of endurance training on sleep quality clinical studies", "priority": 2, "dependencies": []},
+    {"type": "get_fitbit_data", "priority": 3, "dependencies": []},
+    {"type": "get_fitbit_sleep", "priority": 4, "dependencies": []},
+    {"type": "memory_search", "query": "prior notes about training load and fatigue", "priority": 5, "dependencies": []},
+    {"type": "analyze_results", "query": "Analyze search results, Fitbit data, and memories to find correlations; filter out irrelevant content.", "priority": 6, "dependencies": [1,2,3,4,5]},
+    {"type": "synthesize", "query": "Combine all findings into a coherent summary explaining likely mechanisms with evidence weight.", "priority": 7, "dependencies": [6]},
+    {"type": "memory_store", "query": "Key Insight: relationship between training load, RHR, and sleep efficiency.", "priority": 8, "dependencies": [7]},
+    {"type": "formulate_response", "query": "Create a comprehensive, evidence-based response with actionable guidance.", "priority": 9, "dependencies": [7]}
   ]
-}
-
-IMPORTANT:
-- Do NOT create new action types
-- Do NOT use action types like "get_current_time", "analyze_sleep_metrics", "find_actionable_strategies", or "synthesize_recovery_plan"
-- ONLY use the 6 action types listed above
-- Use targeted medical/health search terms to avoid irrelevant results
-- Return ONLY the JSON, nothing else`;
-
-                // Optional environment override for JSON Executor system prompt
-                if (ENV_PROMPTS.jsonExecutorSystem) {
-                    executorSystemPrompt = renderPrompt(ENV_PROMPTS.jsonExecutorSystem, { originalQuery: textToAnalyze });
-                }
+}`;
+            
+            // Optional environment override for JSON Executor system prompt
+            if (ENV_PROMPTS.jsonExecutorSystem) {
+                executorSystemPrompt = renderPrompt(ENV_PROMPTS.jsonExecutorSystem, { originalQuery: textToAnalyze });
+            }
             
             // Create the user prompt for JSON conversion
             const jsonUserPrompt = `Breakdown Steps to Convert:\n${breakdownSteps}\n\nConvert these steps into JSON actions.`;
@@ -1275,15 +1360,29 @@ IMPORTANT:
                     actions: {
                         type: 'array',
                         items: {
-                            type: 'object',
-                            additionalProperties: false,
-                            properties: {
-                                type: { type: 'string', enum: ['google_search','analyze_results','synthesize','formulate_response','get_fitbit_data','get_fitbit_sleep'] },
-                                query: { type: 'string' },
-                                priority: { type: 'integer', minimum: 1, maximum: 10 },
-                                dependencies: { type: 'array', items: { type: 'integer' } }
-                            },
-                            required: ['type','query','priority','dependencies']
+                            oneOf: [
+                                {
+                                    type: 'object',
+                                    additionalProperties: false,
+                                    properties: {
+                                        type: { type: 'string', enum: ['google_search','analyze_results','synthesize','formulate_response','memory_search','memory_store'] },
+                                        query: { type: 'string' },
+                                        priority: { type: 'integer', minimum: 1, maximum: 10 },
+                                        dependencies: { type: 'array', items: { type: 'integer' } }
+                                    },
+                                    required: ['type','query','priority','dependencies']
+                                },
+                                {
+                                    type: 'object',
+                                    additionalProperties: false,
+                                    properties: {
+                                        type: { type: 'string', enum: ['get_fitbit_data','get_fitbit_sleep'] },
+                                        priority: { type: 'integer', minimum: 1, maximum: 10 },
+                                        dependencies: { type: 'array', items: { type: 'integer' } }
+                                    },
+                                    required: ['type','priority','dependencies']
+                                }
+                            ]
                         }
                     }
                 },
@@ -1428,51 +1527,84 @@ async function executeJsonActions(jobId, folderPath, parsedPlan, originalQuery, 
                     break;
                 case 'analyze_results':
                     await executeAnalyzeResults(jobId, folderPath, action, executionResults, originalQuery);
-                    if (executionResults.analysisInsights && executionResults.userProfileId) {
-                        await storeMemory(executionResults.userProfileId, {
-                            title: `AI Analysis Insight: ${originalQuery.substring(0, 50)}...`,
-                            content: executionResults.analysisInsights,
-                            memoryType: 'insight',
-                            sourceType: 'ai_analysis',
-                            sourceId: jobId,
-                            importance: 0.7
-                        });
-                    }
+                    // Implicit memory write disabled. Use a separate 'memory_store' action instead.
+                    // if (executionResults.analysisInsights && executionResults.userProfileId) {
+                    //     await storeMemory(executionResults.userProfileId, {
+                    //         title: `AI Analysis Insight: ${originalQuery.substring(0, 50)}...`,
+                    //         content: executionResults.analysisInsights,
+                    //         memoryType: 'insight',
+                    //         sourceType: 'ai_analysis',
+                    //         sourceId: jobId,
+                    //         importance: 0.7
+                    //     });
+                    // }
                     break;
                 case 'synthesize':
                     await executeSynthesize(jobId, folderPath, action, executionResults, originalQuery);
-                    if (executionResults.synthesisInsights && executionResults.userProfileId) {
-                        await storeMemory(executionResults.userProfileId, {
-                            title: `AI Synthesis Insight: ${originalQuery.substring(0, 50)}...`,
-                            content: executionResults.synthesisInsights,
-                            memoryType: 'insight',
-                            sourceType: 'ai_analysis',
-                            sourceId: jobId,
-                            importance: 0.8
-                        });
-                    }
+                    // Implicit memory write disabled. Use a separate 'memory_store' action instead.
+                    // if (executionResults.synthesisInsights && executionResults.userProfileId) {
+                    //     await storeMemory(executionResults.userProfileId, {
+                    //         title: `AI Synthesis Insight: ${originalQuery.substring(0, 50)}...`,
+                    //         content: executionResults.synthesisInsights,
+                    //         memoryType: 'insight',
+                    //         sourceType: 'ai_analysis',
+                    //         sourceId: jobId,
+                    //         importance: 0.8
+                    //     });
+                    // }
                     break;
                 case 'formulate_response':
                     await executeFormulateResponse(jobId, folderPath, action, executionResults, originalQuery);
-                    if (executionResults.finalResponse) {
-                        const targetUserId = executionResults.userProfileId;
-                        if (targetUserId) {
-                            await storeMemory(targetUserId, {
-                                title: `AI Response: ${originalQuery.substring(0, 50)}...`,
-                                content: executionResults.finalResponse,
-                                memoryType: 'conversation',
-                                sourceType: 'ai_analysis',
-                                sourceId: jobId,
-                                importance: 0.6
-                            });
-                        }
-                    }
+                    // Implicit memory write disabled. Use a separate 'memory_store' action instead.
+                    // if (executionResults.finalResponse) {
+                    //     const targetUserId = executionResults.userProfileId;
+                    //     if (targetUserId) {
+                    //         await storeMemory(targetUserId, {
+                    //             title: `AI Response: ${originalQuery.substring(0, 50)}...`,
+                    //             content: executionResults.finalResponse,
+                    //             memoryType: 'conversation',
+                    //             sourceType: 'ai_analysis',
+                    //             sourceId: jobId,
+                    //             importance: 0.6
+                    //         });
+                    //     }
+                    // }
                     break;
                 case 'get_fitbit_data':
                     await executeFitbitData(jobId, folderPath, action, executionResults);
                     break;
                 case 'get_fitbit_sleep':
                     await executeFitbitSleep(jobId, folderPath, action, executionResults);
+                    break;
+                case 'memory_search':
+                    if (executionResults.userProfileId) {
+                        try {
+                            const matches = await searchMemories(executionResults.userProfileId, action.query || '', 0.7, 5);
+                            executionResults.lastMemoryMatches = matches;
+                            console.log(`[Job ${jobId}] memory_search found ${matches?.length || 0} matches`);
+                        } catch (e) {
+                            console.warn(`[Job ${jobId}] Memory search (analysis) failed:`, e.message);
+                        }
+                    }
+                    break;
+                case 'memory_store':
+                    if (executionResults.userProfileId && action.query) {
+                        try {
+                            const contentToStore = String(action.query);
+                            const title = `AI Memory: ${contentToStore.slice(0, 50)}...`;
+                            await storeMemory(executionResults.userProfileId, {
+                                title,
+                                content: contentToStore,
+                                memoryType: 'insight',
+                                sourceType: 'ai_analysis',
+                                sourceId: jobId,
+                                importance: 0.7
+                            });
+                            console.log(`[Job ${jobId}] memory_store persisted ${contentToStore.length} chars`);
+                        } catch (e) {
+                            console.warn(`[Job ${jobId}] Memory store failed:`, e.message);
+                        }
+                    }
                     break;
                 default:
                     console.log(`[Job ${jobId}] Unknown action type: ${action.type}`);
@@ -1653,9 +1785,9 @@ Always ensure final step synthesizes everything into user response.
 
 ## EXECUTOR SYSTEM PROMPT:
 You are a health-focused AI task executor. Convert the breakdown steps above into a JSON array of actions with high-quality search queries. Each action should have:
-- "type": the action type - MUST be one of: google_search, analyze_results, synthesize, formulate_response, get_fitbit_data, get_fitbit_sleep
-- "query": the specific search query or instruction (use targeted medical/health terms for searches)
-- "priority": number from 1-10 (LOWER numbers = HIGHER priority)
+- "type": the action type - MUST be one of: google_search, analyze_results, synthesize, formulate_response, get_fitbit_data, get_fitbit_sleep, memory_search, memory_store
+- "query": the specific search query or instruction
+- "priority": number from 1-10 (lower = higher priority)
 - "dependencies": array of step numbers this depends on
 
 SEARCH QUALITY REQUIREMENTS:
@@ -1671,10 +1803,12 @@ SUPPORTED ACTION TYPES ONLY:
 - formulate_response: Create evidence-based final user response
 - get_fitbit_data: Get user's Fitbit activity data
 - get_fitbit_sleep: Get user's Fitbit sleep data
+- memory_search: Search long-term memories for context
+- memory_store: Store important insights to long-term memory
 
 MEMORY AWARENESS:
 - Long-term memory functions exist (storeMemory, searchMemories). Do NOT create memory action types.
-- When prior knowledge would help, add a note in the action's "query" (e.g., "consult relevant prior memories about [X]") so the system can incorporate memories internally.
+- When prior memories would help, add a note in the action's "query" text (e.g., "consult relevant prior memories about [X]") so the system can incorporate memories internally.
 
 Return ONLY valid JSON in this format:
 {
@@ -1691,7 +1825,8 @@ Return ONLY valid JSON in this format:
 IMPORTANT:
 - Do NOT create new action types
 - Do NOT use action types like "get_current_time", "analyze_sleep_metrics", "find_actionable_strategies", or "synthesize_recovery_plan"
-- ONLY use the 6 action types listed above
+- ONLY use the 8 action types listed above
+- Use targeted medical/health search terms to avoid irrelevant results
 - Return ONLY the JSON, nothing else
 
 Otherwise, if current progress is sufficient, just provide your analysis in natural language format.`;
@@ -1737,8 +1872,11 @@ Otherwise, if current progress is sufficient, just provide your analysis in natu
 IMPORTANT:
 - Do NOT create new action types
 - Do NOT use action types like "get_current_time", "analyze_sleep_metrics", "find_actionable_strategies", or "synthesize_recovery_plan"
-- ONLY use the 6 action types listed above
-- Return ONLY the JSON, nothing else`;
+- ONLY use the 8 action types listed above
+- Use targeted medical/health search terms to avoid irrelevant results
+- Return ONLY the JSON, nothing else
+
+`;
 
             try {
                 // Call Ollama to convert breakdown to JSON
